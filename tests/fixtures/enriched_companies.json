@@ -1,0 +1,59 @@
+[
+  {
+    "company_name": "Acme Property Management",
+    "domain": "acmepm.com",
+    "hq_state": "CA",
+    "hq_city": "San Francisco",
+    "unit_count_numeric": 250,
+    "pms": "AppFolio",
+    "website": "https://acmepm.com",
+    "icp_score": 85,
+    "employee_count": 25,
+    "decision_makers": [
+      {
+        "full_name": "John Smith",
+        "first_name": "John",
+        "last_name": "Smith",
+        "email": "john.smith@acmepm.com",
+        "job_title": "Property Manager",
+        "linkedin_url": "https://linkedin.com/in/johnsmith",
+        "phone": "(415) 555-0101"
+      },
+      {
+        "full_name": "Jane Doe",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "email": "jane.doe@acmepm.com",
+        "job_title": "Director of Operations",
+        "linkedin_url": "https://linkedin.com/in/janedoe",
+        "phone": "(415) 555-0102"
+      }
+    ],
+    "technologies": ["AppFolio", "Salesforce", "Slack"],
+    "description": "Full-service property management company specializing in residential properties"
+  },
+  {
+    "company_name": "Beta Realty Group",
+    "domain": "betarealty.com",
+    "hq_state": "TX",
+    "hq_city": "Austin",
+    "unit_count_numeric": 150,
+    "pms": "Yardi",
+    "website": "https://betarealty.com",
+    "icp_score": 72,
+    "employee_count": 15,
+    "decision_makers": [
+      {
+        "full_name": "Michael Brown",
+        "first_name": "Michael",
+        "last_name": "Brown",
+        "email": "michael.brown@betarealty.com",
+        "job_title": "CEO",
+        "linkedin_url": "https://linkedin.com/in/michaelbrown",
+        "phone": "(512) 555-0201"
+      }
+    ],
+    "technologies": ["Yardi", "HubSpot"],
+    "description": "Boutique property management firm focused on Austin metro area"
+  }
+]

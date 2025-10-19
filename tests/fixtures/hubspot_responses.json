@@ -1,0 +1,61 @@
+{
+  "company_search_found": {
+    "results": [
+      {
+        "id": "12345678",
+        "properties": {
+          "domain": "acmepm.com",
+          "name": "Acme Property Management",
+          "hs_lastmodifieddate": "2025-10-15T12:00:00.000Z",
+          "createdate": "2024-01-15T12:00:00.000Z",
+          "city": "San Francisco",
+          "state": "CA"
+        }
+      }
+    ],
+    "total": 1
+  },
+  "company_search_not_found": {
+    "results": [],
+    "total": 0
+  },
+  "company_with_recent_activity": {
+    "results": [
+      {
+        "id": "12345678",
+        "properties": {
+          "domain": "acmepm.com",
+          "name": "Acme Property Management",
+          "hs_lastmodifieddate": "2025-10-10T12:00:00.000Z",
+          "notes_last_updated": "2025-10-10T12:00:00.000Z"
+        }
+      }
+    ],
+    "total": 1
+  },
+  "company_with_old_activity": {
+    "results": [
+      {
+        "id": "87654321",
+        "properties": {
+          "domain": "oldcompany.com",
+          "name": "Old Company Inc",
+          "hs_lastmodifieddate": "2024-01-15T12:00:00.000Z"
+        }
+      }
+    ],
+    "total": 1
+  },
+  "list_create_success": {
+    "listId": 999,
+    "name": "Test Lead List",
+    "dynamic": false,
+    "objectTypeId": "0-2"
+  },
+  "list_membership_success": {
+    "updated": ["12345678"],
+    "discarded": [],
+    "invalidVids": [],
+    "invalidEmails": []
+  }
+}

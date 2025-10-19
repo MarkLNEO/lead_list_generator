@@ -1,3 +1,10 @@
+"""
+Tests for contact quality evaluation logic.
+
+Tests the quality gates that determine whether a contact has sufficient
+anecdotes and personalization data.
+"""
+
 import pytest
 
 from lead_pipeline import Config, evaluate_contact_quality
@@ -16,6 +23,7 @@ def make_config(**overrides):
     return Config(**base)
 
 
+@pytest.mark.unit
 def test_quality_passes_when_thresholds_met():
     config = make_config(
         contact_min_personal_anecdotes=1,
@@ -36,6 +44,7 @@ def test_quality_passes_when_thresholds_met():
     assert stats["total"] == 2
 
 
+@pytest.mark.unit
 def test_quality_allows_min_total_when_categories_unset():
     config = make_config(
         contact_min_personal_anecdotes=0,
@@ -54,6 +63,7 @@ def test_quality_allows_min_total_when_categories_unset():
     assert stats["reason"] in {"thresholds_met", "total_minimum"}
 
 
+@pytest.mark.unit
 def test_quality_allows_personalization_fallback():
     config = make_config(
         contact_min_personal_anecdotes=2,
@@ -72,6 +82,7 @@ def test_quality_allows_personalization_fallback():
     assert stats["has_personalization"] is True
 
 
+@pytest.mark.unit
 def test_quality_allows_seed_url_dict_entries():
     config = make_config(
         contact_min_personal_anecdotes=1,
@@ -91,6 +102,7 @@ def test_quality_allows_seed_url_dict_entries():
     assert stats["seed_urls"] == 1
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "overrides",
     [

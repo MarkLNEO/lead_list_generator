@@ -1,0 +1,85 @@
+[
+  {
+    "full_name": "John Smith",
+    "first_name": "John",
+    "last_name": "Smith",
+    "email": "john.smith@acmepm.com",
+    "job_title": "Property Manager",
+    "linkedin_url": "https://linkedin.com/in/johnsmith",
+    "phone": "(415) 555-0101",
+    "company": "Acme Property Management",
+    "domain": "acmepm.com",
+    "personal_anecdotes": [
+      "Volunteer at local animal shelter every weekend",
+      "Marathon runner with 5 completed races including Boston Marathon",
+      "Board member of neighborhood HOA in Pacific Heights"
+    ],
+    "professional_anecdotes": [
+      "Manages portfolio of 250+ residential units across San Francisco",
+      "Implemented new tenant screening process that reduced evictions by 30%",
+      "Reduced vacancy rate by 15% through proactive marketing",
+      "Led team through successful AppFolio migration in 2024"
+    ],
+    "seed_urls": [
+      "https://acmepm.com/team",
+      "https://linkedin.com/in/johnsmith"
+    ],
+    "personalization": "Congrats on the successful AppFolio migration and impressive vacancy rate reduction!"
+  },
+  {
+    "full_name": "Jane Doe",
+    "first_name": "Jane",
+    "last_name": "Doe",
+    "email": "jane.doe@acmepm.com",
+    "job_title": "Director of Operations",
+    "linkedin_url": "https://linkedin.com/in/janedoe",
+    "phone": "(415) 555-0102",
+    "company": "Acme Property Management",
+    "domain": "acmepm.com",
+    "personal_anecdotes": [
+      "Active member of NARPM San Francisco chapter",
+      "Mentor for Women in Real Estate group",
+      "Yoga instructor on weekends"
+    ],
+    "professional_anecdotes": [
+      "15+ years experience in property management",
+      "Oversees operations for 25-person team",
+      "Implemented new maintenance ticketing system",
+      "Reduced operating costs by 20% through vendor negotiations"
+    ],
+    "seed_urls": [
+      "https://acmepm.com/leadership",
+      "https://linkedin.com/in/janedoe",
+      "https://narpm.org/members/jane-doe"
+    ],
+    "personalization": "Noticed your NARPM leadership - would love to discuss industry best practices!"
+  },
+  {
+    "full_name": "Michael Brown",
+    "first_name": "Michael",
+    "last_name": "Brown",
+    "email": "michael.brown@betarealty.com",
+    "job_title": "CEO",
+    "linkedin_url": "https://linkedin.com/in/michaelbrown",
+    "phone": "(512) 555-0201",
+    "company": "Beta Realty Group",
+    "domain": "betarealty.com",
+    "personal_anecdotes": [
+      "UT Austin graduate and Longhorns fan",
+      "Loves Austin food scene, regular at Franklin BBQ",
+      "Father of two, active in local schools"
+    ],
+    "professional_anecdotes": [
+      "Founded Beta Realty in 2015 with 10 units, now manages 150+",
+      "Focused on sustainable property management practices",
+      "Active speaker at Austin Real Estate conferences",
+      "Recently expanded into student housing market"
+    ],
+    "seed_urls": [
+      "https://betarealty.com/about",
+      "https://linkedin.com/in/michaelbrown",
+      "https://austinbusinessjournal.com/michael-brown-profile"
+    ],
+    "personalization": "Impressive growth from 10 to 150+ units since 2015!"
+  }
+]

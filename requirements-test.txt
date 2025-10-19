@@ -1,0 +1,30 @@
+# Testing Dependencies for Lead Pipeline
+# Install with: pip install -r requirements-test.txt
+
+# Core Testing Framework
+pytest==7.4.3
+pytest-cov==4.1.0          # Coverage reporting
+pytest-mock==3.12.0        # Mocking utilities
+pytest-xdist==3.5.0        # Parallel test execution
+pytest-timeout==2.2.0      # Test timeouts
+
+# HTTP Mocking
+responses==0.24.1          # HTTP response mocking
+httpretty==1.1.7           # HTTP mock server
+
+# Fixtures & Data
+pytest-faker==2.0.0        # Fake data generation
+freezegun==1.4.0           # Time mocking
+
+# Assertions & Utilities
+pytest-clarity==1.0.1      # Better assertion output
+pytest-sugar==0.9.7        # Better test output
+
+# Code Quality
+black==23.12.1             # Code formatting
+flake8==7.0.0              # Linting
+mypy==1.8.0                # Type checking
+
+# Coverage & Reporting
+coverage[toml]==7.4.0      # Coverage with TOML support
+pytest-html==4.1.1         # HTML test reports

@@ -1,3 +1,10 @@
+"""
+Tests for contact discovery and extraction logic.
+
+Tests the N8NEnrichmentClient's ability to discover and extract contacts
+from various response formats.
+"""
+
 import pytest
 
 from lead_pipeline import Config, N8NEnrichmentClient, _http_request  # noqa: F401
@@ -15,6 +22,8 @@ def make_config():
     )
 
 
+@pytest.mark.unit
+@pytest.mark.webhook
 def test_extract_contacts_from_message_response():
     payload = {
         "index": 0,
@@ -41,6 +50,8 @@ def test_extract_contacts_from_message_response():
     assert contacts[0]["name"] == "Ryan Smith"
 
 
+@pytest.mark.unit
+@pytest.mark.webhook
 def test_extract_contacts_from_list_of_messages():
     payload = [
         {
@@ -62,6 +73,8 @@ def test_extract_contacts_from_list_of_messages():
     assert {c["name"] for c in contacts} == {"Armin Herteux", "Shawn Kruse"}
 
 
+@pytest.mark.unit
+@pytest.mark.webhook
 def test_extract_contacts_from_plain_list():
     payload = [
         {"name": "A", "job_title": "CEO"},
@@ -73,6 +86,8 @@ def test_extract_contacts_from_plain_list():
     assert len(contacts) == 2
 
 
+@pytest.mark.unit
+@pytest.mark.webhook
 def test_discover_contacts_deduplicates(monkeypatch):
     config = make_config()
     client = N8NEnrichmentClient(config)

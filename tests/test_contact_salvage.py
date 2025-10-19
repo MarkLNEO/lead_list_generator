@@ -1,3 +1,11 @@
+"""
+Tests for contact anecdote salvage logic.
+
+Tests the orchestrator's ability to salvage anecdotes from various
+nested payload structures.
+"""
+
+import pytest
 from lead_pipeline import Config, LeadOrchestrator
 
 
@@ -15,6 +23,7 @@ def make_orchestrator():
     )
 
 
+@pytest.mark.unit
 def test_salvage_contact_anecdotes_from_nested_payload():
     orchestrator = make_orchestrator()
     contact = {
@@ -46,6 +55,7 @@ def test_salvage_contact_anecdotes_from_nested_payload():
     assert contact["seed_urls"] == ["https://example.com/about"]
 
 
+@pytest.mark.unit
 def test_salvage_uses_summary_sections():
     orchestrator = make_orchestrator()
     contact = {

@@ -1,0 +1,124 @@
+{
+  "discovery_success": [
+    {
+      "company_name": "Delta Properties LLC",
+      "domain": "deltaproperties.com",
+      "hq_state": "NY",
+      "hq_city": "New York",
+      "unit_count": 400,
+      "pms": "Buildium",
+      "website": "https://deltaproperties.com"
+    },
+    {
+      "company_name": "Epsilon Management Co",
+      "domain": "epsilonmgmt.com",
+      "hq_state": "IL",
+      "hq_city": "Chicago",
+      "unit_count": 175,
+      "pms": "Yardi",
+      "website": "https://epsilonmgmt.com"
+    }
+  ],
+  "discovery_empty": [],
+  "company_enrichment_success": {
+    "company_name": "Acme Property Management",
+    "domain": "acmepm.com",
+    "icp_score": 85,
+    "employee_count": 25,
+    "decision_makers": [
+      {
+        "full_name": "John Smith",
+        "email": "john.smith@acmepm.com",
+        "job_title": "Property Manager",
+        "linkedin_url": "https://linkedin.com/in/johnsmith"
+      }
+    ]
+  },
+  "company_enrichment_no_decision_makers": {
+    "company_name": "Acme Property Management",
+    "domain": "acmepm.com",
+    "icp_score": 85,
+    "employee_count": 25,
+    "decision_makers": []
+  },
+  "contact_discovery_success": {
+    "message": {
+      "role": "assistant",
+      "content": {
+        "contacts": [
+          {
+            "name": "Ryan Smith",
+            "job_title": "Managing Partner",
+            "company": "Acme Property Management",
+            "domain": "acmepm.com",
+            "linkedin_url": "https://linkedin.com/in/ryan"
+          }
+        ],
+        "total_found": 1
+      }
+    }
+  },
+  "contact_enrichment_success": {
+    "message": {
+      "role": "assistant",
+      "content": {
+        "full_name": "John Smith",
+        "email": "john.smith@acmepm.com",
+        "personal": [
+          "Volunteer at local animal shelter",
+          "Marathon runner with 5 completed races",
+          "Board member of neighborhood HOA"
+        ],
+        "professional": [
+          "Manages portfolio of 250+ units",
+          "Implemented new tenant screening process",
+          "Reduced vacancy rate by 15%"
+        ],
+        "seed_urls": [
+          "https://acmepm.com/team",
+          "https://linkedin.com/in/johnsmith"
+        ],
+        "personalization": "Congrats on your impressive vacancy rate reduction!"
+      }
+    }
+  },
+  "contact_enrichment_insufficient_anecdotes": {
+    "message": {
+      "role": "assistant",
+      "content": {
+        "full_name": "John Smith",
+        "email": "john.smith@acmepm.com",
+        "personal": ["Likes coffee"],
+        "professional": [],
+        "seed_urls": []
+      }
+    }
+  },
+  "email_verification_valid": {
+    "email": "john.smith@acmepm.com",
+    "valid": true,
+    "score": 95,
+    "status": "deliverable",
+    "free_email": false,
+    "disposable": false,
+    "role": false
+  },
+  "email_verification_role_based": {
+    "email": "info@acmepm.com",
+    "valid": false,
+    "score": 30,
+    "status": "undeliverable",
+    "free_email": false,
+    "disposable": false,
+    "role": true
+  },
+  "email_verification_invalid": {
+    "email": "invalid@notarealdomain.xyz",
+    "valid": false,
+    "score": 0,
+    "status": "undeliverable",
+    "free_email": false,
+    "disposable": false,
+    "role": false
+  }
+}

@@ -1,0 +1,57 @@
+[
+  {
+    "company_name": "Acme Property Management",
+    "domain": "acmepm.com",
+    "hq_state": "CA",
+    "hq_city": "San Francisco",
+    "unit_count_numeric": 250,
+    "pms": "AppFolio",
+    "website": "https://acmepm.com",
+    "phone": "(415) 555-0100",
+    "employee_count": 25
+  },
+  {
+    "company_name": "Beta Realty Group",
+    "domain": "betarealty.com",
+    "hq_state": "TX",
+    "hq_city": "Austin",
+    "unit_count_numeric": 150,
+    "pms": "Yardi",
+    "website": "https://betarealty.com",
+    "phone": "(512) 555-0200",
+    "employee_count": 15
+  },
+  {
+    "company_name": "Gamma Property Services",
+    "domain": "gammapropertyservices.com",
+    "hq_state": "FL",
+    "hq_city": "Miami",
+    "unit_count_numeric": 300,
+    "pms": "AppFolio",
+    "website": "https://gammapropertyservices.com",
+    "phone": "(305) 555-0300",
+    "employee_count": 30
+  },
+  {
+    "company_name": "Delta Properties LLC",
+    "domain": "deltaproperties.com",
+    "hq_state": "NY",
+    "hq_city": "New York",
+    "unit_count_numeric": 400,
+    "pms": "Buildium",
+    "website": "https://deltaproperties.com",
+    "phone": "(212) 555-0400",
+    "employee_count": 45
+  },
+  {
+    "company_name": "Epsilon Management Co",
+    "domain": "epsilonmgmt.com",
+    "hq_state": "IL",
+    "hq_city": "Chicago",
+    "unit_count_numeric": 175,
+    "pms": "Yardi",
+    "website": "https://epsilonmgmt.com",
+    "phone": "(312) 555-0500",
+    "employee_count": 20
+  }
+]
