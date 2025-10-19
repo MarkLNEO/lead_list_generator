@@ -20,7 +20,7 @@ cp .env.local.example .env.local
 python lead_pipeline.py --state CA --pms AppFolio --quantity 50
 ```
 
-**Full guide**: See [QUICKSTART.md](QUICKSTART.md)
+**Full guide**: See [QUICKSTART.md](docs/QUICKSTART.md)
 
 ---
 
@@ -113,7 +113,7 @@ DISCOVERY_MAX_ROUNDS=8
 TOPUP_MAX_ROUNDS=8
 ```
 
-**Full reference**: See [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md#configuration)
+**Full reference**: See [PRODUCTION_GUIDE.md](docs/operations/PRODUCTION_GUIDE.md#configuration)
 
 ---
 
@@ -121,10 +121,11 @@ TOPUP_MAX_ROUNDS=8
 
 | Document | Purpose | Audience |
 |----------|---------|----------|
-| [QUICKSTART.md](QUICKSTART.md) | 5-minute setup guide | New users |
-| [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md) | Complete operations manual | Operators |
-| [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Deployment readiness report | Technical leadership |
-| [CHANGELOG.md](CHANGELOG.md) | Version history | All |
+| [QUICKSTART.md](docs/QUICKSTART.md) | 5-minute setup guide | New users |
+| [PRODUCTION_GUIDE.md](docs/operations/PRODUCTION_GUIDE.md) | Complete operations manual | Operators |
+| [PRODUCTION_READINESS.md](docs/operations/PRODUCTION_READINESS.md) | Deployment readiness report | Technical leadership |
+| [CHANGELOG.md](docs/CHANGELOG.md) | Version history | All |
+| [TESTING_GUIDE.md](docs/testing/TESTING_GUIDE.md) | Testing documentation | Developers |
 
 ---
 
@@ -234,7 +235,7 @@ jq ".companies_returned / .requested_quantity" runs/<run_id>/output.json
 | No results | Widen search (remove city/unit filters) |
 | Pipeline interrupted | Re-run with same parameters (auto-resumes) |
 
-**Full troubleshooting**: See [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md#troubleshooting)
+**Full troubleshooting**: See [PRODUCTION_GUIDE.md](docs/operations/PRODUCTION_GUIDE.md#troubleshooting)
 
 ---
 
@@ -286,7 +287,7 @@ jq ".companies_returned / .requested_quantity" runs/<run_id>/output.json
 
 ## 🚨 Support
 
-1. **Self-Service**: Check [QUICKSTART.md](QUICKSTART.md) and [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md)
+1. **Self-Service**: Check [QUICKSTART.md](docs/QUICKSTART.md) and [PRODUCTION_GUIDE.md](docs/operations/PRODUCTION_GUIDE.md)
 2. **Logs**: Review `runs/<run_id>/run.log` for error details
 3. **Metrics**: Inspect `runs/<run_id>/metrics.json` for performance data
 4. **Contact**: mark@nevereverordinary.com (include run_id and logs)
@@ -295,7 +296,7 @@ jq ".companies_returned / .requested_quantity" runs/<run_id>/output.json
 
 ## 📝 Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for version history.
+See [CHANGELOG.md](docs/CHANGELOG.md) for version history.
 
 **Latest**: v2.0.0 - Production hardening release (2025-10-17)
 
@@ -359,7 +360,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 **Status**: READY FOR PRODUCTION DEPLOYMENT
 
-See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for full assessment.
+See [PRODUCTION_READINESS.md](docs/operations/PRODUCTION_READINESS.md) for full assessment.
 
 ---
 
@@ -378,4 +379,4 @@ Proprietary - All rights reserved
 
 ---
 
-**Ready to go?** → [QUICKSTART.md](QUICKSTART.md) → Run your first pipeline in 5 minutes!
+**Ready to go?** → [QUICKSTART.md](docs/QUICKSTART.md) → Run your first pipeline in 5 minutes!
