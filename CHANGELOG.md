@@ -2,6 +2,22 @@
 
 All notable changes to the Lead Pipeline Orchestrator.
 
+## [2.0.1] - 2025-10-18 - Queue Automation & Discovery Tuning
+
+### ✨ Added
+- Supabase queue processor (`--process-request-queue`) now runs pending `enrichment_requests` automatically, updates history, and emails owners on completion or failure.
+- Owner notification emails fire on every successful run; failures alert the owner only, keeping clients unaware until the rerun succeeds.
+
+### 🔄 Changed
+- Default `DISCOVERY_REQUEST_TIMEOUT` lowered to **1800 seconds (30 minutes)** for faster failure detection; documentation updated with guidance on when to raise it.
+- Documentation and production guide refreshed to reflect automated persistence back to Supabase and the new owner notifications.
+
+### 🧪 Testing
+- `python -m pytest`
+- `./test_production.sh`
+
+---
+
 ## [2.0.0] - 2025-10-17 - Production Hardening Release
 
 ### 🎯 Major Changes
@@ -259,8 +275,8 @@ MAX_ENRICHMENT_RETRIES=2
 **Timeout Recommendations** (existing variables, new recommended values):
 ```bash
 # Old: 480s (8 min)
-# New: 7200s (2 hours)
-DISCOVERY_REQUEST_TIMEOUT=7200
+# New: 1800s (30 minutes) default; increase only if the discovery workflow is progressing but slow
+DISCOVERY_REQUEST_TIMEOUT=1800
 
 # Old: 600s (10 min)
 # New: 7200s (2 hours)
@@ -291,10 +307,10 @@ CONTACT_ENRICHMENT_REQUEST_TIMEOUT=7200
    cp .env.local .env.local.backup
    ```
 
-2. **Update timeouts** (recommended):
+2. **Update timeouts** (recommended starting point):
    ```bash
    # Add to .env.local
-   DISCOVERY_REQUEST_TIMEOUT=7200
+   DISCOVERY_REQUEST_TIMEOUT=1800
    COMPANY_ENRICHMENT_REQUEST_TIMEOUT=7200
    CONTACT_ENRICHMENT_REQUEST_TIMEOUT=7200
    ```
