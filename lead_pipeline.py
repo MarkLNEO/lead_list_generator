@@ -1296,6 +1296,41 @@ class DiscoveryWebhookClient:
 
     def _parse_companies(self, response: Any) -> List[Dict[str, Any]]:
         """Normalize arbitrary webhook responses into company records."""
+        collected: List[Dict[str, Any]] = []
+
+        def collect_from_node(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    collect_from_node(item)
+                return
+            if not isinstance(node, dict):
+                return
+
+            # Direct company list
+            companies = node.get("companies")
+            if isinstance(companies, list):
+                for company in companies:
+                    if isinstance(company, dict):
+                        collected.append(company)
+
+            # Results payload may be list or dict
+            results = node.get("results")
+            if isinstance(results, dict):
+                collect_from_node(results)
+            elif isinstance(results, list):
+                collect_from_node(results)
+
+            # Some payloads tuck entities under message.content.*
+            if "message" in node and isinstance(node["message"], dict):
+                collect_from_node(node["message"])
+            if "content" in node and isinstance(node["content"], dict):
+                collect_from_node(node["content"])
+
+        collect_from_node(response)
+
+        if collected:
+            return [self._normalize_company(company) for company in collected]
+
         if isinstance(response, list):
             # n8n flows often wrap in a single-element list
             if len(response) == 1 and isinstance(response[0], dict):
@@ -1345,6 +1380,8 @@ class DiscoveryWebhookClient:
             location_city = None
             location_state = None
 
+        portal_url = company.get("portal_url")
+
         domain = (
             company.get("domain")
             or company.get("website")
@@ -1357,11 +1394,17 @@ class DiscoveryWebhookClient:
         if domain.startswith("www."):
             domain = domain[4:]
 
+        if not domain and isinstance(portal_url, str):
+            parsed_portal = urllib.parse.urlparse(portal_url)
+            domain = (parsed_portal.netloc or parsed_portal.path or "").lower()
+
         website = company.get("website")
         if website and not website.startswith("http"):
             website = f"https://{website}"
         elif not website and domain:
             website = f"https://{domain}"
+        if not website and isinstance(portal_url, str):
+            website = portal_url
 
         estimated_units = None
         units_obj = company.get("estimated_units_managed")
