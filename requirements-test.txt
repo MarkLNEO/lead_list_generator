@@ -10,7 +10,7 @@ pytest-timeout==2.2.0      # Test timeouts
 
 # HTTP Mocking
 responses==0.24.1          # HTTP response mocking
-httpretty==1.1.7           # HTTP mock server
+httpretty==1.1.4           # HTTP mock server
 
 # Fixtures & Data
 pytest-faker==2.0.0        # Fake data generation

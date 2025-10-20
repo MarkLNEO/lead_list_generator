@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: lead_pipeline
+Version: 2.0.0
+Summary: Lead List Orchestrator - Production-Ready Lead Generation Pipeline
+Author: Mark Lerner
+Requires-Python: >=3.9
+Provides-Extra: test
+Requires-Dist: pytest>=7.4.3; extra == "test"
+Requires-Dist: pytest-cov>=4.1.0; extra == "test"
+Requires-Dist: pytest-mock>=3.12.0; extra == "test"
+Requires-Dist: pytest-xdist>=3.5.0; extra == "test"
+Requires-Dist: pytest-timeout>=2.2.0; extra == "test"
+Dynamic: author
+Dynamic: provides-extra
+Dynamic: requires-python
+Dynamic: summary
