@@ -1313,6 +1313,12 @@ class DiscoveryWebhookClient:
                     if isinstance(company, dict):
                         collected.append(company)
 
+            final_results = node.get("final_results")
+            if isinstance(final_results, list):
+                for company in final_results:
+                    if isinstance(company, dict):
+                        collected.append(company)
+
             # Results payload may be list or dict
             results = node.get("results")
             if isinstance(results, dict):
@@ -1381,6 +1387,7 @@ class DiscoveryWebhookClient:
             location_state = None
 
         portal_url = company.get("portal_url")
+        website_provenance = company.get("website_provenance")
 
         domain = (
             company.get("domain")
@@ -1397,6 +1404,9 @@ class DiscoveryWebhookClient:
         if not domain and isinstance(portal_url, str):
             parsed_portal = urllib.parse.urlparse(portal_url)
             domain = (parsed_portal.netloc or parsed_portal.path or "").lower()
+        if not domain and isinstance(website_provenance, str):
+            parsed_prov = urllib.parse.urlparse(website_provenance)
+            domain = (parsed_prov.netloc or parsed_prov.path or "").lower()
 
         website = company.get("website")
         if website and not website.startswith("http"):
@@ -1405,6 +1415,8 @@ class DiscoveryWebhookClient:
             website = f"https://{domain}"
         if not website and isinstance(portal_url, str):
             website = portal_url
+        if not website and isinstance(website_provenance, str):
+            website = website_provenance
 
         estimated_units = None
         units_obj = company.get("estimated_units_managed")
