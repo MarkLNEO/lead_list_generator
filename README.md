@@ -99,7 +99,7 @@ N8N_CONTACT_ENRICH_WEBHOOK=<webhook_url>
 
 ```bash
 # Timeouts (in seconds)
-DISCOVERY_REQUEST_TIMEOUT=7200       # 2 hours
+DISCOVERY_REQUEST_TIMEOUT=1800       # 30 minutes (raise only if discovery is progressing slowly)
 COMPANY_ENRICHMENT_REQUEST_TIMEOUT=7200
 CONTACT_ENRICHMENT_REQUEST_TIMEOUT=7200
 EMAIL_VERIFICATION_REQUEST_TIMEOUT=240
@@ -231,7 +231,7 @@ jq ".companies_returned / .requested_quantity" runs/<run_id>/output.json
 | Issue | Solution |
 |-------|----------|
 | Health check failed | `SKIP_HEALTH_CHECK=true python lead_pipeline.py ...` |
-| Discovery timeout | Increase `DISCOVERY_REQUEST_TIMEOUT=10800` |
+| Discovery timeout | Increase `DISCOVERY_REQUEST_TIMEOUT=3600` (1h) or `=10800` (3h) |
 | No results | Widen search (remove city/unit filters) |
 | Pipeline interrupted | Re-run with same parameters (auto-resumes) |
 

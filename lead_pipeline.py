@@ -1296,6 +1296,47 @@ class DiscoveryWebhookClient:
 
     def _parse_companies(self, response: Any) -> List[Dict[str, Any]]:
         """Normalize arbitrary webhook responses into company records."""
+        collected: List[Dict[str, Any]] = []
+
+        def collect_from_node(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    collect_from_node(item)
+                return
+            if not isinstance(node, dict):
+                return
+
+            # Direct company list
+            companies = node.get("companies")
+            if isinstance(companies, list):
+                for company in companies:
+                    if isinstance(company, dict):
+                        collected.append(company)
+
+            final_results = node.get("final_results")
+            if isinstance(final_results, list):
+                for company in final_results:
+                    if isinstance(company, dict):
+                        collected.append(company)
+
+            # Results payload may be list or dict
+            results = node.get("results")
+            if isinstance(results, dict):
+                collect_from_node(results)
+            elif isinstance(results, list):
+                collect_from_node(results)
+
+            # Some payloads tuck entities under message.content.*
+            if "message" in node and isinstance(node["message"], dict):
+                collect_from_node(node["message"])
+            if "content" in node and isinstance(node["content"], dict):
+                collect_from_node(node["content"])
+
+        collect_from_node(response)
+
+        if collected:
+            return [self._normalize_company(company) for company in collected]
+
         if isinstance(response, list):
             # n8n flows often wrap in a single-element list
             if len(response) == 1 and isinstance(response[0], dict):
@@ -1328,8 +1369,8 @@ class DiscoveryWebhookClient:
 
     def _normalize_company(self, company: Dict[str, Any]) -> Dict[str, Any]:
         """Convert discovery output into the internal company schema."""
-        # Handle nested location metadata
         location = company.get("location")
+        location_text = ""
         if isinstance(location, dict):
             location_city = (
                 location.get("headquarters_city")
@@ -1341,9 +1382,16 @@ class DiscoveryWebhookClient:
                 or location.get("headquarters_state")
                 or location.get("region")
             )
+            location_region = location.get("region")
         else:
             location_city = None
             location_state = None
+            location_region = None
+            if isinstance(location, str):
+                location_text = location.strip()
+
+        portal_url = company.get("portal_url")
+        website_provenance = company.get("website_provenance")
 
         domain = (
             company.get("domain")
@@ -1357,11 +1405,27 @@ class DiscoveryWebhookClient:
         if domain.startswith("www."):
             domain = domain[4:]
 
+        if not domain and isinstance(portal_url, str):
+            parsed_portal = urllib.parse.urlparse(portal_url)
+            domain = (parsed_portal.netloc or parsed_portal.path or "").lower()
+        if not domain and isinstance(website_provenance, str):
+            parsed_prov = urllib.parse.urlparse(website_provenance)
+            domain = (parsed_prov.netloc or parsed_prov.path or "").lower()
+
         website = company.get("website")
         if website and not website.startswith("http"):
             website = f"https://{website}"
         elif not website and domain:
             website = f"https://{domain}"
+        if not website and isinstance(portal_url, str):
+            website = portal_url
+        if not website and isinstance(website_provenance, str):
+            website = website_provenance
+
+        service_areas: List[str] = []
+        raw_service_areas = company.get("service_areas")
+        if isinstance(raw_service_areas, list):
+            service_areas = [item.strip() for item in raw_service_areas if isinstance(item, str) and item.strip()]
 
         estimated_units = None
         units_obj = company.get("estimated_units_managed")
@@ -1381,17 +1445,29 @@ class DiscoveryWebhookClient:
         identified_pms = company.get("identified_pms")
         if isinstance(identified_pms, dict):
             pms_name = identified_pms.get("name") or identified_pms.get("pms")
+        elif isinstance(identified_pms, list) and identified_pms and isinstance(identified_pms[0], str):
+            pms_name = identified_pms[0]
+
+        region = (
+            company.get("region")
+            or location_region
+            or (service_areas[0] if service_areas else None)
+            or location_text
+            or ""
+        )
 
         return {
             "source": "discovery",
             "company_name": company.get("company_name") or company.get("name") or "",
             "domain": domain.lower(),
-            "city": company.get("city") or location_city or "",
+            "city": company.get("city") or location_city or location_text,
             "state": company.get("state") or location_state or "",
+            "region": region,
             "pms": company.get("pms") or company.get("software") or pms_name or "",
             "unit_count": company.get("unit_count") or estimated_units,
             "employee_count": company.get("employee_count") or estimated_employees,
             "company_url": website or (f"https://{domain}" if domain else ""),
+            "state_of_operations": service_areas or None,
             "missing_fields": company.get("missing_fields") if isinstance(company.get("missing_fields"), list) else None,
         }
 
@@ -2558,6 +2634,24 @@ class LeadOrchestrator:
             return None
         
         self._track_api_call("enrichment", success=True)
+
+        # Fill missing geography fields from discovery data when enrichment does not supply them
+        location_fallbacks = {
+            "hq_city": ["hq_city", "city"],
+            "hq_state": ["hq_state", "state"],
+            "city": ["city", "hq_city"],
+            "state": ["state", "hq_state"],
+            "region": ["region"],
+            "state_of_operations": ["state_of_operations"],
+        }
+        for target_field, fallback_fields in location_fallbacks.items():
+            value = enriched_company.get(target_field)
+            if value in (None, "", []):
+                for source_field in fallback_fields:
+                    source_value = company.get(source_field)
+                    if source_value not in (None, "", []):
+                        enriched_company[target_field] = source_value
+                        break
         
         # Process contacts with deduplication
         verified_contacts = self._discover_and_verify_contacts(enriched_company, company)
@@ -3120,13 +3214,19 @@ class LeadOrchestrator:
                 name = c.get("company_name", "")
                 website = c.get("company_url", "")
                 location = " ".join(filter(None, [c.get("hq_city"), c.get("hq_state")]))
+                if not location:
+                    location = c.get("region", "")
                 unit_count = c.get("unit_count", "")
                 icp_score = c.get("icp_score", "")
                 tsf = c.get("targeting_single_family")
                 if tsf is None:
                     tsf = c.get("single_family")
                 pms = c.get("pms", "")
-                state_ops = c.get("state_of_operations", "")
+                state_ops_val = c.get("state_of_operations", "")
+                if isinstance(state_ops_val, list):
+                    state_ops = "; ".join(state_ops_val)
+                else:
+                    state_ops = state_ops_val or ""
                 enrichment_date = c.get("enrichment_date") or datetime.utcnow().isoformat()
                 state = c.get("hq_state", "")
                 region = c.get("region", "")
@@ -3146,6 +3246,8 @@ class LeadOrchestrator:
             for item in items:
                 c = item.get("company", {})
                 company_loc = " ".join(filter(None, [c.get("hq_city"), c.get("hq_state")]))
+                if not company_loc:
+                    company_loc = c.get("region", "")
                 for p in item.get("contacts", []):
                     name = p.get("full_name", "")
                     title = p.get("title", "")
@@ -3169,6 +3271,30 @@ class LeadOrchestrator:
             "Your lead list is ready.",
             "",
         ]
+        try:
+            input_record = json.loads((run_dir / "input.json").read_text())
+        except Exception:
+            input_record = {}
+        request_args = input_record.get("args", {}) if isinstance(input_record, dict) else {}
+        req_parts = []
+        if request_args:
+            req_parts.append(
+                f"Requested {request_args.get('quantity')} companies "
+                f"(state={request_args.get('state')}, city={request_args.get('city')}, location={request_args.get('location')}, pms={request_args.get('pms')})"
+            )
+        try:
+            output_record = json.loads((run_dir / "output.json").read_text())
+        except Exception:
+            output_record = {}
+        delivered_companies = output_record.get("companies_returned")
+        delivered_contacts = sum(len(item.get("contacts", [])) for item in output_record.get("companies", [])) if isinstance(output_record.get("companies"), list) else None
+        if delivered_companies is not None:
+            req_parts.append(f"Delivered {delivered_companies} companies")
+        if delivered_contacts is not None:
+            req_parts.append(f"{delivered_contacts} verified contacts")
+        if req_parts:
+            lines.append("; ".join(req_parts))
+            lines.append("")
         if list_info and (list_info.get("company_list_id") or list_info.get("contact_list_id")):
             comp_link = list_info.get("company_list_url") or f"Company List ID: {list_info.get('company_list_id')}"
             cont_link = list_info.get("contact_list_url") or f"Contact List ID: {list_info.get('contact_list_id')}"
@@ -3177,6 +3303,10 @@ class LeadOrchestrator:
         else:
             lines.append("Note: HubSpot lists were not created. You can upload the attached CSVs manually.")
         lines.append("")
+        if request_args:
+            lines.append("Original request payload:")
+            lines.append(json.dumps(request_args, indent=2))
+            lines.append("")
         lines.append(f"Run folder: {run_dir}")
         msg.set_content("\n".join(lines))
         for p in (companies_csv, contacts_csv):

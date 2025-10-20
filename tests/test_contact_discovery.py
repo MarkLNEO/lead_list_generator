@@ -7,7 +7,7 @@ from various response formats.
 
 import pytest
 
-from lead_pipeline import Config, N8NEnrichmentClient, _http_request  # noqa: F401
+from lead_pipeline import Config, DiscoveryWebhookClient, N8NEnrichmentClient, _http_request  # noqa: F401
 
 
 def make_config():
@@ -113,3 +113,30 @@ def test_discover_contacts_deduplicates(monkeypatch):
 
     assert len(contacts) == 1
     assert contacts[0]["full_name"] == "Ryan Smith"
+
+
+def test_parse_discovery_final_results_portal_url():
+    client = DiscoveryWebhookClient("http://example.com", timeout=60)
+    payload = {
+        "index": 0,
+        "message": {
+            "role": "assistant",
+            "content": {
+                "final_results": [
+                    {
+                        "company_name": "Portal Only LLC",
+                        "website": None,
+                        "website_provenance": "https://portalonly.propertyware.com",
+                        "identified_pms": ["Propertyware"],
+                    }
+                ]
+            },
+        },
+    }
+
+    results = client._parse_companies(payload)
+    assert len(results) == 1
+    company = results[0]
+    assert company["company_name"] == "Portal Only LLC"
+    assert company["company_url"] == "https://portalonly.propertyware.com"
+    assert company["domain"] == "portalonly.propertyware.com"

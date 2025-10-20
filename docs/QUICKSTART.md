@@ -115,8 +115,8 @@ SKIP_HEALTH_CHECK=true python lead_pipeline.py ...
 
 ### "Discovery webhook timeout"
 ```bash
-# Increase timeout
-DISCOVERY_REQUEST_TIMEOUT=10800 python lead_pipeline.py ...
+# Start with the 30-minute default, then dial up if the workflow is progressing slowly
+DISCOVERY_REQUEST_TIMEOUT=3600 python lead_pipeline.py ...
 ```
 
 ### "No results returned"

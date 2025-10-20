@@ -62,14 +62,14 @@ FAILSAFE_EMAIL=<fallback_email>
 
 ```bash
 # Recommended Production Timeouts
-DISCOVERY_REQUEST_TIMEOUT=7200          # 2 hours (discovery is slow)
+DISCOVERY_REQUEST_TIMEOUT=1800          # 30 minutes (fail fast; raise if discovery is healthy but slow)
 COMPANY_ENRICHMENT_REQUEST_TIMEOUT=7200 # 2 hours
 CONTACT_ENRICHMENT_REQUEST_TIMEOUT=7200 # 2 hours
 CONTACT_DISCOVERY_REQUEST_TIMEOUT=7200  # 2 hours
 EMAIL_VERIFICATION_REQUEST_TIMEOUT=240  # 4 minutes
 ```
 
-**Important**: Discovery and enrichment can take 30-60 minutes per batch. Set timeouts accordingly.
+**Important**: Discovery and enrichment can still stretch past 30 minutes when n8n is backlogged—raise the discovery timeout only after confirming the workflow is progressing.
 
 ### Concurrency & Performance
 
@@ -251,12 +251,12 @@ curl http://10.0.131.72:5678/webhook/<discovery_webhook_id> \
   -X POST -H "Content-Type: application/json" \
   -d '{"state":"KS","pms":"AppFolio","quantity":1}'
 
-# Check timeout setting
+# Check timeout setting (default 1800 seconds / 30 minutes)
 echo $DISCOVERY_REQUEST_TIMEOUT
 ```
 
 **Solutions**:
-- Increase timeout: `DISCOVERY_REQUEST_TIMEOUT=10800` (3 hours)
+- Increase timeout cautiously: `DISCOVERY_REQUEST_TIMEOUT=3600` (1 hour) or `=10800` (3 hours) if the workflow is progressing but slow
 - Check n8n execution logs for workflow errors
 - Verify n8n has sufficient resources (CPU/memory)
 - Reduce `quantity` per discovery call
