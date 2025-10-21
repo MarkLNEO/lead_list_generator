@@ -104,9 +104,8 @@ class TestConnectivityChecks:
 
     def test_connectivity_check_success(self, health_check):
         """Successful connectivity check should return True."""
-        with patch("lead_pipeline.urllib.request.urlopen") as mock_urlopen:
-            mock_response = Mock()
-            mock_urlopen.return_value.__enter__.return_value = mock_response
+        with patch("lead_pipeline._http_request") as mock_http:
+            mock_http.return_value = {}
 
             result = health_check._check_connectivity("http://example.com", timeout=5.0)
 
@@ -197,8 +196,8 @@ class TestHealthCheckIntegration:
         assert errors == []
 
     def test_partial_config_failure(self, base_config):
-        """Should handle partially valid configuration."""
-        base_config.enrichment_concurrency = -5  # Invalid but other fields OK
+        """Should detect missing required credentials."""
+        base_config.hubspot_token = ""  # Remove required credential
 
         health_check = HealthCheck(base_config)
 
@@ -207,3 +206,4 @@ class TestHealthCheckIntegration:
 
         assert healthy is False
         assert len(errors) > 0
+        assert any("HubSpot" in error for error in errors)

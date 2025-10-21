@@ -110,7 +110,7 @@ def _http_request(
                 if not raw:
                     return {}
 
-                content_type = resp.headers.get("Content-Type", "")
+                content_type = resp.headers.get("Content-Type", "") or ""
                 text = raw.decode("utf-8", errors="ignore")
 
                 if "application/json" in content_type.lower():
@@ -305,16 +305,16 @@ class ContactDeduplicator:
         email = (contact.get("email") or "").strip().lower()
         if email:
             return f"email:{email}"
-        
-        linkedin = (contact.get("linkedin") or "").strip().lower()
+
+        linkedin = (contact.get("linkedin") or contact.get("linkedin_url") or "").strip().lower()
         if linkedin:
             return f"linkedin:{linkedin}"
-        
+
         name = (contact.get("full_name") or contact.get("name") or "").strip().lower()
-        company_name = (company.get("company_name") or "").strip().lower()
+        company_name = (company.get("company_name") or company.get("domain") or "").strip().lower()
         if name and company_name:
             return f"name:{name}@{company_name}"
-        
+
         return ""
     
     def is_duplicate(self, contact: Dict[str, Any], company: Dict[str, Any]) -> bool:

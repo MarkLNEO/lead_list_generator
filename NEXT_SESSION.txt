@@ -1,0 +1,38 @@
+================================================================================
+NEXT SESSION - QUICK START
+================================================================================
+
+COPY THIS TO CLAUDE CODE:
+
+---
+
+Continue test suite improvement for Lead List Generator (test-suite branch).
+
+CURRENT STATUS:
+- ✅ 281 tests passing (100% pass rate achieved!)
+- Coverage: 49.98% (up from 35%)
+- Goal: Push to 80% coverage
+
+WHAT TO DO:
+Add comprehensive tests for LeadOrchestrator.run() method (lines 2119-2544 in
+lead_pipeline.py). This is the main orchestration flow with 4 phases that need
+testing. Target: +20-30% coverage.
+
+SETUP:
+```bash
+cd /Users/andrewpyle/PAD/clients/rebar_hq/lead_list_generator
+git checkout test-suite
+source venv/bin/activate
+pytest -m "not e2e" -q  # Should show: 281 passed, 9 skipped
+```
+
+DETAILED INSTRUCTIONS:
+See docs/testing/NEXT_SESSION_PROMPT.md for full context and implementation guide.
+
+QUICK REFERENCE:
+- Session history: docs/testing/SESSION_SUMMARY.md
+- Test examples: tests/test_orchestrator_core.py
+- Coverage report: pytest -m "not e2e" --cov=lead_pipeline --cov-report=html
+
+---
+

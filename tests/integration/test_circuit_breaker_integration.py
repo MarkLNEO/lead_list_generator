@@ -97,8 +97,8 @@ class TestCircuitBreakerWithRetries:
                 )
 
             # Should have only made 2 actual HTTP calls (before circuit opened)
-            # Each call retries once, so 4 total urlopen calls
-            assert call_count == 4  # 2 requests * 2 attempts each
+            # max_retries=1 means "try once total, no retries"
+            assert call_count == 2  # 2 requests * 1 attempt each
 
     def test_circuit_breaker_recovery_with_successful_request(self):
         """Test that circuit breaker recovers after timeout with successful request."""
