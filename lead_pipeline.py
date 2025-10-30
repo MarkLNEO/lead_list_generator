@@ -38,6 +38,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -53,7 +54,453 @@ import hashlib
 from enum import Enum
 from contextlib import contextmanager
 import signal
+from log_capture import RequestLogCapture
 
+US_STATE_ABBREVIATIONS: Dict[str, str] = {
+    "AL": "Alabama",
+    "AK": "Alaska",
+    "AZ": "Arizona",
+    "AR": "Arkansas",
+    "CA": "California",
+    "CO": "Colorado",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "FL": "Florida",
+    "GA": "Georgia",
+    "HI": "Hawaii",
+    "ID": "Idaho",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "IA": "Iowa",
+    "KS": "Kansas",
+    "KY": "Kentucky",
+    "LA": "Louisiana",
+    "ME": "Maine",
+    "MD": "Maryland",
+    "MA": "Massachusetts",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MS": "Mississippi",
+    "MO": "Missouri",
+    "MT": "Montana",
+    "NE": "Nebraska",
+    "NV": "Nevada",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NM": "New Mexico",
+    "NY": "New York",
+    "NC": "North Carolina",
+    "ND": "North Dakota",
+    "OH": "Ohio",
+    "OK": "Oklahoma",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "SD": "South Dakota",
+    "TN": "Tennessee",
+    "TX": "Texas",
+    "UT": "Utah",
+    "VT": "Vermont",
+    "VA": "Virginia",
+    "WA": "Washington",
+    "WV": "West Virginia",
+    "WI": "Wisconsin",
+    "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
+STATE_NAME_TO_ABBR: Dict[str, str] = {name.lower(): abbr for abbr, name in US_STATE_ABBREVIATIONS.items()}
+
+NON_PM_DISQUALIFIER_KEYWORDS = [
+    # Explicit negations (high confidence)
+    "not a property management",
+    "not property management",
+    "not property-manager",
+    "no longer manages properties",
+    "does not manage properties",
+    "discontinued property management",
+
+    # Pure software companies (be more specific)
+    "we are a software company",
+    "pure software company",
+    "saas company only",
+    "exclusively software",
+    "builds software for property managers",
+    "property management software provider",
+
+    # Non-PM business models (be specific)
+    "marketing agency only",
+    "consulting firm only",
+    "exclusively consulting",
+
+    # Specific exclusions
+    "hoa management only",
+    "homeowners association only",
+    "vacation rental only",
+    "short-term rental only",
+    "hotel management only",
+]
+
+PM_POSITIVE_KEYWORDS = [
+    "property management",
+    "property manager",
+    "rental homes",
+    "residential management",
+    "multifamily management",
+    "single family homes",
+    "leasing services",
+    "rentals",
+    "landlord services",
+    "tenant services",
+]
+
+
+def normalize_location_text(value: Optional[str]) -> str:
+    """Normalize free-form location text for fuzzy comparisons."""
+    if not value:
+        return ""
+    text = value.strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def normalize_state_token(value: Optional[str]) -> Optional[str]:
+    """Normalize potential state string to its two-letter abbreviation (lowercase)."""
+    if not value:
+        return None
+    token = value.strip()
+    if not token:
+        return None
+
+    upper = token.upper()
+    if len(upper) == 2 and upper in US_STATE_ABBREVIATIONS:
+        return upper.lower()
+
+    lower = token.lower()
+    if lower in STATE_NAME_TO_ABBR:
+        return STATE_NAME_TO_ABBR[lower].lower()
+
+    # Handle strings like "TN - Tennessee" by splitting on delimiters
+    pieces = [piece.strip() for piece in re.split(r"[,/;|\-]", token) if piece.strip()]
+    for piece in pieces:
+        if piece.lower() == lower:
+            continue
+        normalized = normalize_state_token(piece)
+        if normalized:
+            return normalized
+
+    # Attempt to find two-letter abbreviations within whitespace-separated tokens
+    for candidate in token.split():
+        candidate = candidate.strip()
+        if not candidate or candidate.lower() == lower:
+            continue
+        normalized = normalize_state_token(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def split_location_tokens(value: str) -> List[str]:
+    """Split compound location strings into comparable tokens."""
+    return [token.strip() for token in re.split(r"[,/;|]", value) if token.strip()]
+
+
+def value_to_strings(value: Any) -> List[str]:
+    """Convert nested location values into a flat list of strings."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    if isinstance(value, list):
+        results: List[str] = []
+        for item in value:
+            if isinstance(item, (str, int, float)):
+                results.append(str(item))
+        return results
+    if isinstance(value, dict):
+        results: List[str] = []
+        for item in value.values():
+            results.extend(value_to_strings(item))
+        return results
+    return []
+
+
+def parse_location_to_city_state(location: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Attempt to derive city/state components from a free-form location string."""
+    if not location:
+        return None, None
+    text = location.strip()
+    if not text:
+        return None, None
+
+    # Handle format "City ST"
+    match = re.match(r"^(?P<city>.+?)[,\\s]+(?P<state>[A-Za-z]{2})$", text)
+    if match:
+        city = match.group("city").rstrip(", ").strip()
+        state = match.group("state").upper()
+        if state in US_STATE_ABBREVIATIONS:
+            return city, state
+
+    # Split on common separators
+    parts = [part.strip() for part in re.split(r"[,/;]", text) if part.strip()]
+    if not parts:
+        return None, None
+
+    derived_city: Optional[str] = None
+    derived_state: Optional[str] = None
+
+    for part in reversed(parts):
+        cleaned_part = part.strip(", ")
+        state_token = normalize_state_token(part)
+        if state_token and not derived_state:
+            derived_state = state_token.upper()
+            continue
+        if not derived_city:
+            derived_city = cleaned_part
+
+    if not derived_city:
+        primary_part = parts[0]
+        if derived_state:
+            pattern = rf"[,\s]+{re.escape(derived_state)}$"
+            trimmed = re.sub(pattern, "", primary_part, flags=re.IGNORECASE).strip()
+            if not trimmed and derived_state in US_STATE_ABBREVIATIONS:
+                full_state = US_STATE_ABBREVIATIONS[derived_state]
+                pattern_full = rf"[,\s]+{re.escape(full_state)}$"
+                trimmed = re.sub(pattern_full, "", primary_part, flags=re.IGNORECASE).strip()
+            derived_city = trimmed or primary_part
+        else:
+            derived_city = primary_part
+
+    if derived_city:
+        derived_city = derived_city.strip(", ").strip()
+
+    return derived_city, derived_state
+
+
+def company_matches_location(
+    company: Dict[str, Any],
+    *,
+    city: Optional[str],
+    state: Optional[str],
+    location_text: Optional[str],
+) -> bool:
+    """
+    Determine whether a company record aligns with the requested geography.
+
+    The function checks state, city, and fallback free-text matches across a variety of
+    location-related fields present in both Supabase and discovery payloads.
+    """
+    if not (city or state or location_text):
+        return True
+
+    inferred_city = city
+    inferred_state = state
+    if location_text:
+        derived_city, derived_state = parse_location_to_city_state(location_text)
+        if not inferred_city and derived_city:
+            inferred_city = derived_city
+        if not inferred_state and derived_state:
+            inferred_state = derived_state
+
+    state_norm = normalize_state_token(inferred_state)
+    city_norm = normalize_location_text(inferred_city)
+    location_norm = normalize_location_text(location_text)
+
+    city_sources = (
+        value_to_strings(company.get("hq_city"))
+        + value_to_strings(company.get("city"))
+        + value_to_strings(company.get("region"))
+        + value_to_strings(company.get("location"))
+    )
+    raw_state_sources = (
+        value_to_strings(company.get("hq_state"))
+        + value_to_strings(company.get("state"))
+        + value_to_strings(company.get("state_operations"))
+        + value_to_strings(company.get("state_of_operations"))
+    )
+    state_sources = raw_state_sources or []
+
+    # Ensure state field names with underscores are normalized consistently
+    if not state_sources:
+        # Some datasets encode state inside region/location field
+        state_sources = city_sources
+
+    if state_norm:
+        matched_state = False
+        saw_state_token = False
+        for candidate in state_sources:
+            for token in split_location_tokens(candidate):
+                normalized = normalize_state_token(token)
+                if normalized:
+                    saw_state_token = True
+                if normalized == state_norm:
+                    matched_state = True
+                    break
+            if matched_state:
+                break
+        if saw_state_token and not matched_state:
+            return False
+
+    if city_norm:
+        matched_city = False
+        for candidate in city_sources:
+            if city_norm and city_norm in normalize_location_text(candidate):
+                matched_city = True
+                break
+        if not matched_city:
+            return False
+
+    if not state_norm and not city_norm and location_norm:
+        request_tokens = {token for token in location_norm.split() if token}
+        long_tokens = {token for token in request_tokens if len(token) > 3}
+        if long_tokens:
+            request_tokens = long_tokens
+        matched_location = False
+        for candidate in city_sources + state_sources:
+            normalized_candidate = normalize_location_text(candidate)
+            if not normalized_candidate:
+                continue
+            candidate_tokens = set(normalized_candidate.split())
+            if request_tokens and request_tokens.issubset(candidate_tokens):
+                matched_location = True
+                break
+            if any(token in normalized_candidate for token in request_tokens):
+                matched_location = True
+                break
+        if not matched_location:
+            return False
+
+    return True
+
+
+def evaluate_property_management_status(
+    company: Dict[str, Any],
+    *,
+    strict: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Determine whether a company appears to be a genuine property management firm.
+
+    Args:
+        company: Company metadata from Supabase, discovery, or enrichment.
+        strict: When True, require affirmative property management signals.
+
+    Returns:
+        (allowed, reason) where allowed indicates the company should remain
+        in the pipeline. When allowed is False, reason provides context for logs.
+    """
+    def _as_str(value: Any) -> str:
+        return str(value or "").strip()
+
+    company_name = _as_str(company.get("company_name") or company.get("name") or company.get("domain"))
+
+    icp_fit = _as_str(company.get("icp_fit")).lower()
+    if icp_fit.startswith("no"):
+        return False, "icp_fit=no"
+
+    icp_tier = _as_str(company.get("icp_tier")).upper()
+    if icp_tier in {"D", "F"}:
+        return False, f"icp_tier={icp_tier}"
+
+    disqualifiers = company.get("disqualifiers")
+    if isinstance(disqualifiers, str):
+        disqualifiers_iter = [disqualifiers]
+    elif isinstance(disqualifiers, list):
+        disqualifiers_iter = disqualifiers
+    else:
+        disqualifiers_iter = []
+
+    for entry in disqualifiers_iter:
+        text = _as_str(entry).lower()
+        if any(keyword in text for keyword in NON_PM_DISQUALIFIER_KEYWORDS):
+            return False, "disqualifier"
+
+    summary_fields = [
+        company.get("agent_summary"),
+        company.get("business_model"),
+        company.get("description"),
+        company.get("profile_summary"),
+        company.get("notes"),
+    ]
+    summary_text = " ".join(_as_str(field) for field in summary_fields if field)
+    summary_lower = summary_text.lower()
+
+    # Check for disqualifiers, but we'll override them if there are strong positive signals
+    has_disqualifier = False
+    disqualifier_found = None
+    if summary_lower:
+        for keyword in NON_PM_DISQUALIFIER_KEYWORDS:
+            if keyword in summary_lower:
+                has_disqualifier = True
+                disqualifier_found = keyword
+                break
+
+    qualitative_flags = [
+        _as_str(company.get("single_family")).lower(),
+        _as_str(company.get("single_family_units")).lower(),
+    ]
+    if any(flag.startswith("no") for flag in qualitative_flags) and not _as_str(company.get("unit_count")):
+        return False, "single_family=no_and_units_missing"
+
+    # Count positive signals
+    positive_score = 0
+    positive_reasons = []
+
+    if icp_fit.startswith("yes"):
+        positive_score += 2
+        positive_reasons.append("icp_fit=yes")
+    if icp_tier in {"A", "B", "C"}:
+        positive_score += 2
+        positive_reasons.append(f"icp_tier={icp_tier}")
+
+    # Check for PM keywords with stronger weighting
+    pm_keyword_count = sum(1 for keyword in PM_POSITIVE_KEYWORDS if keyword in summary_lower)
+    if pm_keyword_count > 0:
+        positive_score += pm_keyword_count
+        positive_reasons.append(f"pm_keywords={pm_keyword_count}")
+
+    pms_value = _as_str(company.get("pms")).lower()
+    if pms_value and pms_value not in {"", "n/a", "na", "none"}:
+        positive_score += 2
+        positive_reasons.append(f"pms={pms_value}")
+
+    unit_count_value = _as_str(company.get("unit_count") or company.get("units"))
+    if unit_count_value:
+        try:
+            units = int(float(unit_count_value))
+            if units > 0:
+                positive_score += 1 if units < 100 else 2 if units < 1000 else 3
+                positive_reasons.append(f"units={units}")
+        except ValueError:
+            pass
+
+    # Strong positive signals override disqualifiers
+    if positive_score >= 2:  # Lowered threshold from 3 to 2
+        # Company has PM indicators, accept it
+        if has_disqualifier:
+            logging.debug(
+                "Company has disqualifier '%s' but overridden by positive score %d: %s",
+                disqualifier_found, positive_score, positive_reasons
+            )
+        return True, f"positive_signals({positive_score})"
+
+    # Only reject on disqualifiers if there are NO positive signals
+    if has_disqualifier and positive_score == 0:
+        return False, f"disqualifier({disqualifier_found})"
+
+    # In strict mode, require at least some positive signals
+    if strict and positive_score == 0:
+        return False, "missing_positive_property_signals"
+
+    # Accept companies with any positive signal, even if score is 1
+    if positive_score > 0:
+        return True, f"some_positive_signals({positive_score})"
+
+    return True, ""
 
 # ---------------------------------------------------------------------------
 # HTTP utilities
@@ -393,30 +840,61 @@ def _load_env_file(path: str = ".env.local") -> None:
     Load environment variables from a simple KEY=VALUE file if present.
 
     Existing environment variables take precedence.
+
+    The loader searches the following locations in order until a file is found:
+    1. Explicit override via LEAD_PIPELINE_ENV_FILE environment variable.
+    2. The provided `path` relative to the current working directory.
+    3. The same path relative to this script's directory.
+    4. The same path relative to the project root (parent of this file).
     """
     if not path:
         return
-    if not os.path.exists(path):
-        return
 
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                if not key:
-                    continue
-                if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-                    value = value[1:-1]
-                os.environ.setdefault(key, value)
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Warning: failed to load environment file {path}: {exc}", file=sys.stderr)
+    candidates: List[Path] = []
+    override = os.getenv("LEAD_PIPELINE_ENV_FILE")
+    if override:
+        candidates.append(Path(override).expanduser())
+
+    raw_path = Path(path)
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+    else:
+        candidates.append(Path.cwd() / raw_path)
+
+    script_dir = Path(__file__).resolve().parent
+    candidates.append(script_dir / raw_path)
+    candidates.append(script_dir.parent / raw_path)
+
+    seen: Set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except FileNotFoundError:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+
+        try:
+            with resolved.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if not key:
+                        continue
+                    if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                        value = value[1:-1]
+                    os.environ.setdefault(key, value)
+            # Stop after the first successfully loaded file.
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Warning: failed to load environment file {resolved}: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +1027,7 @@ class Config:
     hubspot_parallelism: int = field(default_factory=lambda: int(os.getenv("HUBSPOT_PARALLELISM", "3")))
     discovery_max_rounds: int = field(default_factory=lambda: int(os.getenv("DISCOVERY_MAX_ROUNDS", "6")))
     discovery_round_delay: float = field(default_factory=lambda: float(os.getenv("DISCOVERY_ROUND_DELAY", "2.0")))
-    email_verification_attempts: int = field(default_factory=lambda: int(os.getenv("EMAIL_VERIFICATION_ATTEMPTS", "3")))
+    email_verification_attempts: int = field(default_factory=lambda: int(os.getenv("EMAIL_VERIFICATION_ATTEMPTS", "1")))
     email_verification_delay: float = field(default_factory=lambda: float(os.getenv("EMAIL_VERIFICATION_DELAY", "2.5")))
     
     # Circuit breaker settings
@@ -561,6 +1039,9 @@ class Config:
     max_companies_per_run: int = field(default_factory=lambda: int(os.getenv("MAX_COMPANIES_PER_RUN", "500")))
     max_contacts_per_company: int = field(default_factory=lambda: int(os.getenv("MAX_CONTACTS_PER_COMPANY", "10")))
     max_enrichment_retries: int = field(default_factory=lambda: int(os.getenv("MAX_ENRICHMENT_RETRIES", "2")))
+    request_processing_stale_seconds: int = field(
+        default_factory=lambda: int(os.getenv("REQUEST_PROCESSING_STALE_SECONDS", "900"))
+    )
 
     def validate(self) -> None:
         """Ensure critical configuration exists and is valid."""
@@ -933,11 +1414,24 @@ class SupabaseResearchClient:
 
     def fetch_pending_requests(self, limit: int = 1) -> List[Dict[str, Any]]:
         """Retrieve pending enrichment requests."""
-        statuses = ["pending", "queued"]
+        return self._fetch_requests_by_status(["pending", "queued"], limit)
+
+    def fetch_processing_requests(self, limit: int = 1) -> List[Dict[str, Any]]:
+        """Retrieve processing enrichment requests."""
+        return self._fetch_requests_by_status(["processing"], limit)
+
+    def _fetch_requests_by_status(
+        self,
+        statuses: Iterable[str],
+        limit: int,
+        *,
+        newest_first: bool = True,
+    ) -> List[Dict[str, Any]]:
         status_filter = ",".join(statuses)
+        order = "request_time.desc" if newest_first else "request_time.asc"
         url = (
             f"{self.base_url}/rest/v1/enrichment_requests"
-            f"?select=*&request_status=in.({status_filter})&order=request_time.asc&limit={limit}"
+            f"?select=*&request_status=in.({status_filter})&order={order}&limit={limit}"
         )
         try:
             response = _http_request("GET", url, headers=self.headers, timeout=15)
@@ -953,12 +1447,15 @@ class SupabaseResearchClient:
         *,
         status: Optional[str] = None,
         request_payload: Optional[Dict[str, Any]] = None,
+        run_logs: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload: Dict[str, Any] = {}
         if status is not None:
             payload["request_status"] = status
         if request_payload is not None:
             payload["request"] = request_payload
+        if run_logs is not None:
+            payload["run_logs"] = run_logs
         if not payload:
             return
         self._patch("enrichment_requests", {"id": str(request_id)}, payload)
@@ -980,7 +1477,6 @@ class SupabaseResearchClient:
             "hq_state": enriched.get("hq_state") or original.get("hq_state") or original.get("state"),
             "pms": enriched.get("pms") or original.get("pms"),
             "unit_count": enriched.get("unit_count") or original.get("unit_count"),
-            "unit_count_numeric": enriched.get("unit_count"),
             "employee_count": enriched.get("employee_count"),
             "agent_summary": enriched.get("agent_summary"),
             "contact_count": contact_count,
@@ -991,10 +1487,11 @@ class SupabaseResearchClient:
         if isinstance(unit_val, str):
             stripped = unit_val.replace(",", "").strip()
             if stripped.isdigit():
-                payload["unit_count_numeric"] = int(stripped)
+                payload["unit_count"] = int(stripped)
         elif isinstance(unit_val, (int, float)):
-            payload["unit_count_numeric"] = int(unit_val)
+            payload["unit_count"] = int(unit_val)
         payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
+        payload.pop("unit_count_numeric", None)
         return self._upsert(self.table, {"domain": domain}, payload)
 
     def persist_contact(
@@ -1021,19 +1518,19 @@ class SupabaseResearchClient:
             "domain": contact.get("domain"),
             "first_name": first_name or None,
             "last_name": last_name or None,
-            "full_name": full_name or None,
             "email": email,
             "email_verified": bool(contact.get("email_verified")),
             "job_title": contact.get("title"),
             "linkedin_url": contact.get("linkedin"),
             "is_decision_maker": True,
-            "research_status": "enriched",
+            "research_status": "basic_complete",
             "outreach_status": "not_started",
             "personalization_notes": contact.get("personalization"),
             "agent_summary": contact.get("agent_summary"),
             "updated_at": datetime.utcnow().isoformat(),
         }
         payload = {k: v for k, v in payload.items() if v not in (None, "", [])}
+        payload.pop("full_name", None)
         return self._upsert(self.contacts_table, {"email": email}, payload)
 
 
@@ -2051,6 +2548,9 @@ class LeadOrchestrator:
             "api_calls": {},
             "errors": [],
         }
+        self.requested_city: Optional[str] = None
+        self.requested_state: Optional[str] = None
+        self.requested_location_text: Optional[str] = None
         
         # Circuit breakers for external services
         self.circuit_breakers = {}
@@ -2114,6 +2614,156 @@ class LeadOrchestrator:
             state["metrics"] = self.metrics
             self.state_manager.save_checkpoint(state)
 
+    def _normalize_request_location(self, args: argparse.Namespace) -> None:
+        """Derive consistent location filters from the incoming request arguments."""
+        location_raw = (args.location or "").strip() or None
+        city = (args.city or "").strip() or None
+        state = (args.state or "").strip() or None
+
+        derived_city: Optional[str] = None
+        derived_state: Optional[str] = None
+        if location_raw:
+            derived_city, derived_state = parse_location_to_city_state(location_raw)
+
+        updates: List[str] = []
+        if not city and derived_city:
+            args.city = derived_city
+            city = derived_city
+            updates.append(f"city='{derived_city}'")
+        if not state and derived_state:
+            args.state = derived_state
+            state = derived_state
+            updates.append(f"state='{derived_state}'")
+        if updates:
+            logging.info(
+                "Derived location filters from location string '%s': %s",
+                location_raw,
+                ", ".join(updates),
+            )
+
+        self.requested_location_text = location_raw
+        self.requested_city = city
+        self.requested_state = state
+
+    def _has_location_filter(self) -> bool:
+        return any(
+            value
+            for value in (self.requested_city, self.requested_state, self.requested_location_text)
+        )
+
+    def _filter_companies_by_location(self, companies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not companies or not self._has_location_filter():
+            return companies
+        matched: List[Dict[str, Any]] = []
+        for company in companies:
+            if company_matches_location(
+                company,
+                city=self.requested_city,
+                state=self.requested_state,
+                location_text=self.requested_location_text,
+            ):
+                matched.append(company)
+            else:
+                logging.debug(
+                    "Filtering out company '%s' due to location mismatch (requested city=%s, state=%s)",
+                    company.get("company_name") or company.get("name") or company.get("domain") or "unknown",
+                    self.requested_city or "",
+                    self.requested_state or "",
+                )
+        if len(matched) != len(companies):
+            logging.info(
+                "Location filter removed %d/%d companies",
+                len(companies) - len(matched),
+                len(companies),
+        )
+        return matched
+
+    def _filter_enriched_results_by_location(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not items or not self._has_location_filter():
+            return items
+        matched: List[Dict[str, Any]] = []
+        for item in items:
+            company = item.get("company") if isinstance(item, dict) else None
+            if not isinstance(company, dict):
+                continue
+            if company_matches_location(
+                company,
+                city=self.requested_city,
+                state=self.requested_state,
+                location_text=self.requested_location_text,
+            ):
+                matched.append(item)
+            else:
+                logging.info(
+                    "Dropping enriched company '%s' due to location mismatch",
+                    company.get("company_name") or company.get("domain") or "unknown",
+                )
+        if len(matched) != len(items):
+            logging.info(
+                "Location filter removed %d/%d enriched companies",
+                len(items) - len(matched),
+                len(items),
+            )
+        return matched
+
+    def _filter_companies_by_property_type(
+        self,
+        companies: List[Dict[str, Any]],
+        *,
+        strict: bool = False,
+    ) -> List[Dict[str, Any]]:
+        if not companies:
+            return []
+        matched: List[Dict[str, Any]] = []
+        for company in companies:
+            allowed, reason = evaluate_property_management_status(company, strict=strict)
+            if allowed:
+                matched.append(company)
+            else:
+                logging.info(
+                    "Filtering out company '%s' due to non-property-management classification (%s)",
+                    company.get("company_name") or company.get("name") or company.get("domain") or "unknown",
+                    reason or "unspecified",
+                )
+        if len(matched) != len(companies):
+            logging.info(
+                "Property-type filter removed %d/%d companies",
+                len(companies) - len(matched),
+                len(companies),
+            )
+        return matched
+
+    def _filter_enriched_results_by_property_type(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+        matched: List[Dict[str, Any]] = []
+        for item in items:
+            company = item.get("company") if isinstance(item, dict) else None
+            if not isinstance(company, dict):
+                continue
+            allowed, reason = evaluate_property_management_status(company, strict=True)
+            if allowed:
+                matched.append(item)
+            else:
+                logging.info(
+                    "Dropping enriched company '%s' due to non-property-management classification (%s)",
+                    company.get("company_name") or company.get("domain") or "unknown",
+                    reason or "unspecified",
+                )
+        if len(matched) != len(items):
+            logging.info(
+                "Property-type filter removed %d/%d enriched companies",
+                len(items) - len(matched),
+                len(items),
+            )
+        return matched
+
     def run(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Execute pipeline with production resilience and recovery."""
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
@@ -2124,6 +2774,9 @@ class LeadOrchestrator:
         
         # Initialize state management
         self.state_manager = StateManager(run_dir)
+
+        # Initialize tracking for ALL attempted companies to prevent infinite loops
+        self.all_attempted_domains = set()
         
         # Setup logging
         fh = logging.FileHandler(str(run_dir / "run.log"))
@@ -2156,6 +2809,14 @@ class LeadOrchestrator:
             self.config.contact_min_total_anecdotes,
             "on" if self.config.contact_allow_personalization_fallback else "off",
             "on" if self.config.contact_allow_seed_url_fallback else "off",
+        )
+
+        self._normalize_request_location(args)
+        logging.info(
+            "Location filters applied: state=%s, city=%s, location_text=%s",
+            self.requested_state or args.state or "N/A",
+            self.requested_city or args.city or "N/A",
+            self.requested_location_text or "N/A",
         )
         
         # Persist input
@@ -2258,6 +2919,10 @@ class LeadOrchestrator:
                     
                     filtered = self._apply_suppression(discovered)
                     logging.info("Discovery round %d: %d companies after suppression", attempt, len(filtered))
+                    filtered = self._filter_companies_by_location(filtered)
+                    logging.info("Discovery round %d: %d companies after location filter", attempt, len(filtered))
+                    filtered = self._filter_companies_by_property_type(filtered, strict=False)
+                    logging.info("Discovery round %d: %d companies after property filter", attempt, len(filtered))
                     companies = self._merge_companies(companies, filtered)
                     
                     # Checkpoint after each discovery round
@@ -2283,9 +2948,20 @@ class LeadOrchestrator:
             # Phase 3: Enrichment
             logging.info("=== Phase 3: Company enrichment (processing %d companies) ===", min(len(companies), buffer_quantity))
             trimmed = companies[:buffer_quantity]
+            # Track all companies we're attempting to enrich
+            for c in trimmed:
+                self.all_attempted_domains.add(self._domain_key(c))
             results = self._enrich_companies_resilient(trimmed, run_dir)
+            results = self._filter_enriched_results_by_location(results)
+            results = self._filter_enriched_results_by_property_type(results)
             deliverable = results[:target_quantity]
-            
+
+            # Critical: Check if we have any results after filtering
+            if not deliverable and results:
+                logging.warning("All %d enriched companies were filtered out!", len(results))
+            elif not deliverable:
+                logging.warning("No companies found after enrichment phase")
+
             logging.info("Enriched companies: %d (target: %d)", len(deliverable), target_quantity)
             
             # Phase 4: Top-up if needed
@@ -2293,9 +2969,18 @@ class LeadOrchestrator:
             if missing > 0:
                 logging.info("=== Phase 4: Top-up round (need %d more) ===", missing)
                 deliverable = self._topup_results(deliverable, missing, args, run_dir)
-            
+                deliverable = self._filter_enriched_results_by_location(deliverable)
+                deliverable = self._filter_enriched_results_by_property_type(deliverable)
+
+            # CRITICAL FIX: Don't mark as complete if we have 0 results
+            if len(deliverable) == 0:
+                error_msg = f"Pipeline produced 0 results after filtering (requested: {target_quantity})"
+                logging.error(error_msg)
+                self._track_error("Zero results after filtering", {"requested": target_quantity})
+                raise ValueError(error_msg)
+
             logging.info("Pipeline complete: %d fully enriched companies", len(deliverable))
-            
+
             # Save outputs
             result_obj = self._finalize_results(deliverable, target_quantity, buffer_quantity, run_dir, run_id)
             self._notify_owner_success(run_dir, result_obj)
@@ -2329,7 +3014,21 @@ class LeadOrchestrator:
             unit_max=args.unit_max,
             limit=limit,
         )
-        return self._apply_suppression(supabase_companies)
+        initial_count = len(supabase_companies)
+        supabase_companies = self._apply_suppression(supabase_companies)
+        after_suppression = len(supabase_companies)
+        supabase_companies = self._filter_companies_by_location(supabase_companies)
+        after_location = len(supabase_companies)
+        supabase_companies = self._filter_companies_by_property_type(supabase_companies, strict=False)
+        after_property = len(supabase_companies)
+
+        logging.info("Supabase filtering: initial=%d → suppression=%d → location=%d → property=%d",
+                     initial_count, after_suppression, after_location, after_property)
+
+        if after_property == 0 and initial_count > 0:
+            logging.warning("All Supabase companies were filtered out! Check filter criteria.")
+
+        return supabase_companies
 
     def _apply_suppression(self, companies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not companies:
@@ -2655,7 +3354,7 @@ class LeadOrchestrator:
         
         # Process contacts with deduplication
         verified_contacts = self._discover_and_verify_contacts(enriched_company, company)
-        
+
         if not verified_contacts:
             logging.info("No verified contacts for %s, rejecting", company.get("company_name"))
             return None
@@ -2879,39 +3578,50 @@ class LeadOrchestrator:
                 logging.warning("Contact enrichment failed for %s: %s", full_name, exc)
                 return None
 
-        # Round 1: Decision makers from enrichment
-        while attempts_left > 0 and len(verified_contacts) < max_contacts:
-            attempts_left -= 1
-            
-            if attempts_left == 1:
-                # First attempt: use decision makers from enrichment
+        # Process contacts - up to 2 rounds if needed
+        for round_num in range(1, 3):  # Rounds 1 and 2
+            # Check if we already have enough contacts
+            if len(verified_contacts) >= max_contacts:
+                logging.info("Already have %d verified contacts (max: %d), skipping further rounds",
+                           len(verified_contacts), max_contacts)
+                break
+
+            if len(verified_contacts) >= 1:  # At least one contact is usually enough
+                logging.info("Have %d verified contacts, continuing with those", len(verified_contacts))
+                break
+
+            if round_num == 1:
+                # First round: use decision makers from enrichment
                 decision_makers = list(enriched_company.get("decision_makers", [])) or []
-                logging.info("Enrichment returned %d decision makers for %s", 
+                logging.info("Round 1: Enrichment returned %d decision makers for %s",
                            len(decision_makers), enriched_company.get("company_name"))
                 if not decision_makers:
-                    # Fall back to contact discovery
+                    # Fall back to contact discovery immediately
                     logging.info("No decision makers from enrichment, calling contact discovery webhook for %s",
                                enriched_company.get("company_name"))
                     try:
                         decision_makers = self.enrichment.discover_contacts(enriched_company)
-                        logging.info("Contact discovery returned %d contacts for %s", 
+                        logging.info("Contact discovery returned %d contacts for %s",
                                    len(decision_makers), enriched_company.get("company_name"))
                         self.metrics["contacts_discovered"] += len(decision_makers)
                     except Exception as exc:
-                        logging.warning("Contact discovery failed for %s: %s", 
+                        logging.warning("Contact discovery failed for %s: %s",
                                       enriched_company.get("company_name"), exc)
                         decision_makers = []
             else:
-                # Second attempt: contact discovery
-                logging.info("Round 2: Calling contact discovery webhook for %s", 
+                # Only do Round 2 if Round 1 yielded no verified contacts
+                if len(verified_contacts) > 0:
+                    break
+
+                logging.info("Round 2: Calling contact discovery webhook for %s (had 0 verified contacts after Round 1)",
                            enriched_company.get("company_name"))
                 try:
                     decision_makers = self.enrichment.discover_contacts(enriched_company)
-                    logging.info("Contact discovery returned %d contacts for %s", 
+                    logging.info("Round 2 contact discovery returned %d contacts for %s",
                                len(decision_makers), enriched_company.get("company_name"))
                     self.metrics["contacts_discovered"] += len(decision_makers)
                 except Exception as exc:
-                    logging.warning("Contact discovery failed for %s: %s",
+                    logging.warning("Round 2 contact discovery failed for %s: %s",
                                   enriched_company.get("company_name"), exc)
                     decision_makers = []
 
@@ -2919,6 +3629,10 @@ class LeadOrchestrator:
                 continue
 
             # Process contacts concurrently
+            # First, mark all already-verified contacts as seen to prevent duplicates
+            for vc in verified_contacts:
+                self.deduplicator.mark_seen(vc, enriched_company)
+
             with ThreadPoolExecutor(max_workers=contact_workers) as cpool:
                 futures = [cpool.submit(process_contact, dm) for dm in decision_makers]
                 for fut in as_completed(futures):
@@ -3019,26 +3733,34 @@ class LeadOrchestrator:
         tried_domains: Set[str] = {
             self._domain_key(r.get("company", {})) for r in current_results
         }
+        # CRITICAL: Also include ALL companies that have been attempted during this run
+        # to prevent infinite loops of retrying the same failed companies
+        if hasattr(self, 'all_attempted_domains'):
+            tried_domains.update(self.all_attempted_domains)
+        else:
+            self.all_attempted_domains = set()
+
         extra_rounds = 0
         max_extra = max(2, int(os.getenv("TOPUP_MAX_ROUNDS", "3")))
         
         while missing > 0 and extra_rounds < max_extra:
             extra_rounds += 1
             logging.info("Top-up round %d: need %d more companies", extra_rounds, missing)
-            buffer_target, buffer_multiplier = self._calculate_buffer_target(missing)
+            # DON'T apply buffer multiplier in top-up phase - we just need the exact missing amount
+            # The buffer was already calculated for the original request
+            discovery_target = missing
             logging.info(
-                "Top-up discovery target: %d (multiplier: %.2fx)",
-                buffer_target,
-                buffer_multiplier,
+                "Top-up discovery target: %d (no multiplier - exact amount needed)",
+                discovery_target,
             )
-            
+
             suppression_domains = tried_domains.copy()
             try:
                 discovered = self.discovery.discover(
                     location=args.location,
                     state=args.state,
                     pms=args.pms,
-                    quantity=buffer_target,
+                    quantity=discovery_target,
                     unit_count_min=args.unit_min,
                     unit_count_max=args.unit_max,
                     suppression_domains=suppression_domains,
@@ -3047,6 +3769,10 @@ class LeadOrchestrator:
                 )
                 
                 new_filtered = self._apply_suppression(discovered)
+                new_filtered = self._filter_companies_by_location(new_filtered)
+                logging.info("Top-up round %d: %d companies after location filter", extra_rounds, len(new_filtered))
+                new_filtered = self._filter_companies_by_property_type(new_filtered, strict=False)
+                logging.info("Top-up round %d: %d companies after property filter", extra_rounds, len(new_filtered))
                 for c in new_filtered:
                     tried_domains.add(self._domain_key(c))
                 
@@ -3057,7 +3783,7 @@ class LeadOrchestrator:
                         location=None,
                         state=args.state,
                         pms=args.pms,
-                        quantity=buffer_target,
+                        quantity=discovery_target,
                         unit_count_min=args.unit_min,
                         unit_count_max=args.unit_max,
                         suppression_domains=tried_domains,
@@ -3065,6 +3791,10 @@ class LeadOrchestrator:
                         attempt=self.config.discovery_max_rounds + extra_rounds,
                     )
                     new_filtered = self._apply_suppression(discovered2)
+                    new_filtered = self._filter_companies_by_location(new_filtered)
+                    logging.info("Top-up round %d (expanded): %d companies after location filter", extra_rounds, len(new_filtered))
+                    new_filtered = self._filter_companies_by_property_type(new_filtered, strict=False)
+                    logging.info("Top-up round %d (expanded): %d companies after property filter", extra_rounds, len(new_filtered))
                     for c in new_filtered:
                         tried_domains.add(self._domain_key(c))
 
@@ -3073,8 +3803,16 @@ class LeadOrchestrator:
                     break
                 
                 enrich_candidates = new_filtered[:missing]
+                # Track ALL companies we're about to try enriching
+                for c in enrich_candidates:
+                    domain = self._domain_key(c)
+                    tried_domains.add(domain)
+                    self.all_attempted_domains.add(domain)
+
                 topup_results = self._enrich_companies_resilient(enrich_candidates, run_dir)
-                
+                topup_results = self._filter_enriched_results_by_location(topup_results)
+                topup_results = self._filter_enriched_results_by_property_type(topup_results)
+
                 for r in topup_results:
                     if len(current_results) < self.current_target_quantity:
                         current_results.append(r)
@@ -3438,8 +4176,11 @@ class EnrichmentRequestProcessor:
     def process(self, limit: int = 1) -> None:
         pending = self.supabase.fetch_pending_requests(limit)
         if not pending:
-            logging.info("No pending enrichment requests found")
-            return
+            self._reset_stale_processing_requests(limit)
+            pending = self.supabase.fetch_pending_requests(limit)
+            if not pending:
+                logging.info("No pending enrichment requests found")
+                return
         for record in pending:
             request_id = record.get("id")
             try:
@@ -3471,12 +4212,63 @@ class EnrichmentRequestProcessor:
 
         orchestrator = LeadOrchestrator(run_config)
         run_result = None
-        try:
-            run_result = orchestrator.run(args)
-            self._mark_request_completed(request_id, request_payload, run_result)
-        except Exception as exc:  # pylint: disable=broad-except
-            self._mark_request_failed(request_id, request_payload, orchestrator, exc)
-            raise
+
+        # Capture logs for this request
+        with RequestLogCapture(self.supabase, request_id):
+            try:
+                run_result = orchestrator.run(args)
+                self._mark_request_completed(request_id, request_payload, run_result)
+            except Exception as exc:  # pylint: disable=broad-except
+                self._mark_request_failed(request_id, request_payload, orchestrator, exc)
+                raise
+
+    def _reset_stale_processing_requests(self, limit: int) -> None:
+        """
+        Detect requests stuck in 'processing' state beyond the stale threshold and reset them to pending.
+        """
+        threshold = max(60, self.base_config.request_processing_stale_seconds)
+        # Fetch a small batch of candidates and inspect timestamps client-side
+        candidates = self.supabase.fetch_processing_requests(limit * 3)
+        now_ts = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+        for record in candidates:
+            request_id = record.get("id")
+            payload = record.get("request") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            else:
+                payload = dict(payload)
+            last_attempt = payload.get("last_attempt_at")
+            stale = False
+
+            if not last_attempt:
+                stale = True
+            else:
+                try:
+                    normalized = last_attempt.rstrip("Z")
+                    if normalized and not normalized.endswith("+00:00"):
+                        normalized += "+00:00"
+                    attempt_ts = datetime.fromisoformat(normalized)
+                    if attempt_ts.tzinfo is None:
+                        attempt_ts = attempt_ts.replace(tzinfo=timezone.utc)
+                    age = (now_ts - attempt_ts).total_seconds()
+                    stale = age >= threshold
+                except Exception:  # noqa: BLE001
+                    stale = True
+
+            if stale and request_id is not None:
+                logging.warning(
+                    "Re-queueing stale processing request %s (last_attempt_at=%s)",
+                    request_id,
+                    last_attempt or "none",
+                )
+                # Remove last_attempt marker so the next run records a fresh timestamp
+                payload.pop("last_attempt_at", None)
+                self.supabase.update_request_record(
+                    request_id,
+                    status="pending",
+                    request_payload=payload,
+                )
 
     def _mark_request_completed(
         self,
