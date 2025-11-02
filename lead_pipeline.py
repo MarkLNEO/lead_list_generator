@@ -39,6 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import re
+import random
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -585,12 +586,16 @@ def _http_request(
 
         except urllib.error.HTTPError as exc:  # type: ignore[assignment]
             if exc.code == 429 and attempt < max_retries:
-                wait_for = _retry_after_delay(exc) or retry_backoff * attempt
+                base_wait = _retry_after_delay(exc) or (retry_backoff * attempt)
+                # Add jitter: multiply by random value between 0.5 and 1.5 to avoid thundering herd
+                wait_for = base_wait * (0.5 + random.random())
                 logging.warning("HTTP 429 from %s; retrying in %.1fs (attempt %d/%d)", url, wait_for, attempt, max_retries)
                 time.sleep(wait_for)
                 continue
             if exc.code >= 500 and attempt < max_retries:
-                wait_for = retry_backoff * attempt
+                base_wait = retry_backoff * attempt
+                # Add jitter to avoid synchronized retries across concurrent requests
+                wait_for = base_wait * (0.5 + random.random())
                 logging.warning(
                     "Server error %s from %s; retrying in %.1fs (attempt %d/%d)",
                     exc.code,
@@ -605,7 +610,9 @@ def _http_request(
 
         except urllib.error.URLError as exc:
             if attempt < max_retries:
-                wait_for = retry_backoff * attempt
+                base_wait = retry_backoff * attempt
+                # Add jitter for network errors to reduce retry collisions
+                wait_for = base_wait * (0.5 + random.random())
                 logging.warning("Network error %s; retrying in %.1fs (attempt %d/%d)", exc, wait_for, attempt, max_retries)
                 time.sleep(wait_for)
                 continue
@@ -1093,13 +1100,13 @@ class Config:
         )
     )
     discovery_request_timeout: float = field(
-        default_factory=lambda: float(os.getenv("DISCOVERY_REQUEST_TIMEOUT", "900"))  # 30 minutes
+        default_factory=lambda: float(os.getenv("DISCOVERY_REQUEST_TIMEOUT", "1800"))  # 30 minutes (restored from aggressive 15min reduction)
     )
     company_enrichment_timeout: float = field(
-        default_factory=lambda: float(os.getenv("COMPANY_ENRICHMENT_REQUEST_TIMEOUT", "900"))  # 2 hours
+        default_factory=lambda: float(os.getenv("COMPANY_ENRICHMENT_REQUEST_TIMEOUT", "3600"))  # 1 hour (balanced: faster than 2h, safer than 15min)
     )
     contact_enrichment_timeout: float = field(
-        default_factory=lambda: float(os.getenv("CONTACT_ENRICHMENT_REQUEST_TIMEOUT", "900"))  # 2 hours
+        default_factory=lambda: float(os.getenv("CONTACT_ENRICHMENT_REQUEST_TIMEOUT", "3600"))  # 1 hour (balanced: faster than 2h, safer than 15min)
     )
     email_verification_timeout: float = field(
         default_factory=lambda: float(os.getenv("EMAIL_VERIFICATION_REQUEST_TIMEOUT", "120"))
@@ -3568,6 +3575,12 @@ class LeadOrchestrator:
             pass
         if d.startswith("www."):
             d = d[4:]
+        # Normalize internationalized domains to ASCII (IDNA encoding)
+        try:
+            d = d.encode("idna").decode("ascii")
+        except Exception:
+            # If IDNA encoding fails, keep the original (may be already ASCII)
+            pass
         parts = d.split(":")[0].split("/")[0].split(".")
         if len(parts) >= 3:
             d = ".".join(parts[-2:])
