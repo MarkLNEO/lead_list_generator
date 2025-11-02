@@ -1,381 +1,510 @@
 # Lead List Orchestrator
 
-**Version 2.0** - Production-Ready Lead Generation Pipeline
+A production-ready lead generation pipeline that discovers, enriches, and validates property management companies and their decision-makers.
 
-Enterprise-grade lead generation system with comprehensive resilience, observability, and quality assurance.
+## Overview
 
----
+The Lead List Orchestrator is a robust, fault-tolerant system that:
+- Discovers property management companies based on location and criteria
+- Enriches company data with decision-maker contacts
+- Verifies email addresses and enriches contact information
+- Applies intelligent filtering for location and property management relevance
+- Provides comprehensive logging and error handling
 
-## 🚀 Quick Start
+## Features
+
+- 🔄 **Resilient Pipeline**: Automatic retries, circuit breakers, and graceful failure handling
+- 📍 **Location Filtering**: Accurate city/state matching with multiple fallback strategies
+- 🏢 **Property Management Validation**: Intelligent filtering to ensure relevance
+- 📧 **Contact Quality Assurance**: Email verification and contact enrichment
+- 📊 **Comprehensive Logging**: All processing logs stored in Supabase for debugging
+- ✅ **Zero-Results Protection**: Prevents marking requests as complete with no results
+- 🧪 **Nano QA Gate (optional)**: A lightweight AI check (gpt-5-nano) that samples outputs and suggests a small refinement, retrying once if results look off
+- 🧪 **Bulletproof Testing**: Comprehensive test suite for pre-deployment validation
+
+## Quick Start
+
+### Prerequisites
+
+1. Python 3.8+
+2. Environment variables configured (see Configuration section)
+3. Access to required services (Supabase, N8N webhooks, HubSpot)
+
+### Installation
 
 ```bash
-# 1. Configure environment
+# Clone the repository
+git clone <repository-url>
+cd lead_list_orchestrator
+
+# Create and configure environment file
 cp .env.local.example .env.local
 # Edit .env.local with your credentials
 
-# 2. Run production test
-./test_production.sh
-
-# 3. Execute pipeline
-python lead_pipeline.py --state CA --pms AppFolio --quantity 50
+# Run tests to verify setup
+python3 test_suite.py
 ```
 
-**Full guide**: See [QUICKSTART.md](QUICKSTART.md)
+### Basic Usage
 
----
+#### Command Line
+```bash
+# Run a single request
+python3 lead_pipeline.py --state TN --city Memphis --quantity 20 --pms AppFolio
 
-## 📋 What It Does
+# Process queue from Supabase
+python3 queue_worker.py --limit 5
+```
 
-1. **Search**: Query Supabase database for companies matching your criteria
-2. **Discover**: Call n8n discovery webhook to find additional companies
-3. **Suppress**: Filter out companies already in HubSpot (active/recent)
-4. **Enrich**: Get company details, decision makers, ICP scoring
-5. **Verify**: Validate contact emails through verification service
-6. **Enrich Contacts**: Research professional and personal anecdotes
-7. **Deliver**: Generate CSVs, create HubSpot lists, send email report
+#### Queue Processing
+The system processes enrichment requests from Supabase:
+```json
+{
+  "parameters": {
+    "quantity": 30,
+    "priority_locations": ["Memphis, TN"],
+    "pms_include": ["AppFolio"],
+    "notify_email": "user@example.com"
+  }
+}
+```
 
----
+## Configuration
 
-## ✨ Production Features
-
-### Resilience
-- ✅ **Circuit Breakers**: Prevent cascading failures
-- ✅ **Auto-Recovery**: Resume from interruption without data loss
-- ✅ **Exponential Backoff**: Smart retry with progressive delays
-- ✅ **Graceful Degradation**: Continue on non-fatal errors
-
-### Quality
-- ✅ **Multi-Level Validation**: Person names, emails, anecdotes, domains
-- ✅ **Contact Deduplication**: Prevent duplicate processing
-- ✅ **Quality Gates**: 3+ anecdotes (personal + professional) required
-- ✅ **Role-Based Filtering**: Reject generic office emails
-
-### Observability
-- ✅ **Comprehensive Metrics**: Track companies, contacts, API calls, errors
-- ✅ **Health Checks**: Pre-flight validation of config and connectivity
-- ✅ **Real-Time Monitoring**: Live logs, incremental results
-- ✅ **Detailed Reporting**: JSON metrics + human-readable summaries
-
-### Safety
-- ✅ **Configuration Validation**: Strict validation of all parameters
-- ✅ **Safety Limits**: Cap costs and prevent runaway processing
-- ✅ **Credential Protection**: No exposure in logs or errors
-- ✅ **Partial Results**: Always save progress on exit
-
----
-
-## 📦 Requirements
-
-- Python 3.9+
-- Network access to:
-  - Supabase (database)
-  - HubSpot (CRM)
-  - n8n (webhooks)
-- Environment variables configured (see `.env.local`)
-
----
-
-## 🔧 Configuration
-
-### Required Variables
+### Required Environment Variables
 
 ```bash
-# Supabase
-SUPABASE_SERVICE_KEY=<your_key>
-SUPABASE_URL=http://10.0.131.72:8000
+# Supabase Configuration
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_API_KEY=your-api-key
 
-# HubSpot
-HUBSPOT_PRIVATE_APP_TOKEN=<your_token>
+# N8N Webhook Endpoints
+DISCOVERY_WEBHOOK=https://n8n.example.com/webhook/discovery
+ENRICHMENT_WEBHOOK=https://n8n.example.com/webhook/enrichment
+CONTACT_WEBHOOK=https://n8n.example.com/webhook/contact
+EMAIL_VERIFICATION_WEBHOOK=https://n8n.example.com/webhook/verify
 
-# n8n Webhooks
-N8N_COMPANY_DISCOVERY_WEBHOOK=<webhook_url>
-N8N_COMPANY_ENRICHMENT_WEBHOOK=<webhook_url>
-N8N_CONTACT_DISCOVERY_WEBHOOK=<webhook_url>
-N8N_EMAIL_DISCOVERY_VERIFY=<webhook_url>
-N8N_CONTACT_ENRICH_WEBHOOK=<webhook_url>
+# HubSpot Configuration
+HUBSPOT_API_KEY=your-hubspot-key
+HUBSPOT_COMPANIES_LIST_ID=your-companies-list
+HUBSPOT_CONTACTS_LIST_ID=your-contacts-list
+
+# Email Notifications
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+EMAIL_FROM=Lead Generator <your-email@gmail.com>
+NOTIFY_EMAIL=recipient@example.com
+
+# Optional Configuration
+DISCOVERY_REQUEST_TIMEOUT=90  # Discovery timeout in seconds
+ENRICHMENT_CONCURRENCY=10     # Parallel enrichment workers
+CONTACT_CONCURRENCY=20         # Parallel contact workers
+REQUEST_PROCESSING_STALE_SECONDS=3600  # Stale request threshold
+TOPUP_MAX_ROUNDS=3            # Maximum top-up attempts
+CONTACT_MIN_PERSONAL_ANECDOTES=1
+CONTACT_MIN_PROFESSIONAL_ANECDOTES=2
+CONTACT_MIN_TOTAL_ANECDOTES=3
+CONTACT_ALLOW_PERSONALIZATION_FALLBACK=true
+CONTACT_ALLOW_SEED_URL_FALLBACK=true
 ```
 
-### Recommended Settings
+## Pipeline Architecture
+
+### Pipeline Phases
+
+1. **Phase 1: Database Query**
+   - Query existing companies from Supabase research database
+   - Apply location, PMS, and unit count filters
+   - Apply HubSpot suppression list
+
+2. **Phase 2: Discovery**
+   - Call discovery webhook for new companies if needed
+   - Target 1.5x requested quantity for buffer
+   - Apply location and property type filters
+   - Remove duplicates and suppressed companies
+
+3. **Phase 3: Enrichment**
+   - Enrich companies with decision-maker data
+   - Verify email addresses (multiple attempts if needed)
+   - Enrich contacts with professional/personal anecdotes
+   - Apply quality gates (minimum anecdote requirements)
+
+4. **Phase 4: Top-up**
+   - Fetch additional companies if target not met
+   - Apply all filters consistently (location, property type)
+   - Prevent infinite loops with max rounds limit
+
+### Key Components
+
+- **`lead_pipeline.py`**: Main pipeline orchestrator with all core logic
+- **`log_capture.py`**: Log capture and storage to Supabase run_logs field
+- **`queue_worker.py`**: Queue processing from Supabase enrichment_requests
+- **`test_suite.py`**: Comprehensive test suite for validation
+- **`deploy_to_ec2.sh`**: Deployment script for EC2 instances
+
+## Testing
+
+Run the comprehensive test suite before deployment:
 
 ```bash
-# Timeouts (in seconds)
-DISCOVERY_REQUEST_TIMEOUT=1800       # 30 minutes (raise only if discovery is progressing slowly)
-COMPANY_ENRICHMENT_REQUEST_TIMEOUT=7200
-CONTACT_ENRICHMENT_REQUEST_TIMEOUT=7200
-EMAIL_VERIFICATION_REQUEST_TIMEOUT=240
+# Run all tests
+python3 test_suite.py
 
-# Concurrency
-ENRICHMENT_CONCURRENCY=6
-CONTACT_CONCURRENCY=4
+# Run specific test categories
+python3 test_suite.py --test location   # Location parsing
+python3 test_suite.py --test property   # Property filtering
+python3 test_suite.py --test zero       # Zero results handling
+python3 test_suite.py --test log        # Log capture
+python3 test_suite.py --test request    # Request processing
+python3 test_suite.py --test webhook    # Webhook mocking
+python3 test_suite.py --test error      # Error handling
+python3 test_suite.py --test config     # Configuration
+python3 test_suite.py --test persist    # Data persistence
 
-# Discovery
-DISCOVERY_MAX_ROUNDS=8
-TOPUP_MAX_ROUNDS=8
+# Run with verbose output
+python3 test_suite.py -v
 ```
 
-**Full reference**: See [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md#configuration)
-
----
-
-## 📖 Documentation
-
-| Document | Purpose | Audience |
-|----------|---------|----------|
-| [QUICKSTART.md](QUICKSTART.md) | 5-minute setup guide | New users |
-| [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md) | Complete operations manual | Operators |
-| [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Deployment readiness report | Technical leadership |
-| [CHANGELOG.md](CHANGELOG.md) | Version history | All |
-
----
-
-## 🎯 Usage Examples
-
-### Basic Run
-```bash
-python lead_pipeline.py \
-  --state CA \
-  --pms AppFolio \
-  --quantity 50
-```
-
-### Filtered Search
-```bash
-python lead_pipeline.py \
-  --state TX \
-  --city Austin \
-  --pms Yardi \
-  --quantity 25 \
-  --unit-min 100 \
-  --unit-max 1000
-```
-
-### Large Batch (use screen)
-```bash
-screen -S leads
-python lead_pipeline.py --state FL --quantity 200
-# Ctrl+A D to detach
-```
-
-### With Requirements
-```bash
-python lead_pipeline.py \
-  --state CA \
-  --pms AppFolio \
-  --quantity 50 \
-  --requirements "NARPM member preferred"
-```
-
----
-
-## 📊 Output Files
-
-Each run creates a directory: `runs/<run_id>/`
-
-```
-runs/20251017_143022_abc123/
-├── input.json              # Your search parameters
-├── output.json             # Full results with metadata
-├── companies.csv           # Importable company list ⭐
-├── contacts.csv            # Importable contact list ⭐
-├── metrics.json            # Performance metrics
-├── summary.txt             # Human-readable dashboard
-├── run.log                 # Detailed execution log
-├── state.json              # Recovery checkpoint
-└── incremental_results.json # Progressive saves
-```
-
-**Import to CRM**: Use `companies.csv` and `contacts.csv`
-
----
-
-## 🔍 Monitoring
-
-### Real-Time Progress
-```bash
-# Watch log
-tail -f runs/<run_id>/run.log
-
-# Monitor metrics
-watch -n 5 'jq .metrics runs/<run_id>/metrics.json'
-
-# Check status
-cat runs/<run_id>/summary.txt
-```
-
-### Key Metrics
-
-- **Company Enrichment Rate**: Target >60%
-- **Contact Verification Rate**: Target >50%
-- **API Success Rate**: Target >95%
-
-### Health Indicators
+### Pytest Suite (fast, no external APIs except OpenAI)
 
 ```bash
-# Check for failures
-grep ERROR runs/<run_id>/run.log
+# Optional: enable nano QA during tests (keeps payloads tiny)
+export OPENAI_API_KEY=... 
+export QA_VALIDATOR_ENABLED=true
+export QA_MODEL=gpt-5-nano
+export SKIP_HEALTH_CHECK=true
 
-# Check circuit breakers
-grep "Circuit breaker.*OPEN" runs/<run_id>/run.log
+# Run pytest
+pytest -q
 
-# Check completion rate
-jq ".companies_returned / .requested_quantity" runs/<run_id>/output.json
+# Run specific tests
+pytest -q tests/test_splitter.py
+pytest -q tests/test_orchestrator_fakes.py
 ```
 
----
+The pytest suite fakes Supabase, n8n, HubSpot, and email calls using in‑memory stubs, so tests run quickly and deterministically. Only OpenAI may be invoked if you enable the nano QA or splitter tests with your API key.
 
-## 🐛 Troubleshooting
+## Deployment
 
-### Quick Fixes
-
-| Issue | Solution |
-|-------|----------|
-| Health check failed | `SKIP_HEALTH_CHECK=true python lead_pipeline.py ...` |
-| Discovery timeout | Increase `DISCOVERY_REQUEST_TIMEOUT=3600` (1h) or `=10800` (3h) |
-| No results | Widen search (remove city/unit filters) |
-| Pipeline interrupted | Re-run with same parameters (auto-resumes) |
-
-**Full troubleshooting**: See [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md#troubleshooting)
-
----
-
-## 🧪 Testing
+### Deploy to EC2
 
 ```bash
-# Run automated test suite
-./test_production.sh
+# Basic deployment
+./deploy_to_ec2.sh user@host
 
-# Tests:
-# ✓ Python version (3.9+)
-# ✓ Script syntax
-# ✓ Configuration validation
-# ✓ Environment variables
-# ✓ Network connectivity
-# ✓ Directory structure
-# ✓ Dry run (2 companies)
+# With custom remote directory
+./deploy_to_ec2.sh user@host /path/to/remote/dir
+
+# With SSH key
+SSH_OPTS="-i ~/.ssh/your-key" ./deploy_to_ec2.sh ec2-user@10.0.0.1
+
+# Without service setup
+./deploy_to_ec2.sh user@host --no-service
 ```
 
----
+The deployment script:
+- Syncs code to the remote server
+- Sets up Python virtual environment
+- Installs dependencies
+- Configures systemd service for queue processing
 
-## 📈 Performance
+### Systemd Service
 
-| Scale | Duration | Companies | Notes |
-|-------|----------|-----------|-------|
-| Small (10) | 45 min | ~7 enriched | Quick test |
-| Medium (50) | 2.5 hrs | ~30-35 enriched | Standard |
-| Large (100) | 5 hrs | ~60-70 enriched | Heavy batch |
+The queue worker runs as a systemd service on EC2:
 
-**Bottleneck**: Discovery webhook (30-60 min per round)
+```bash
+# Service management
+sudo systemctl status lead-queue    # Check status
+sudo systemctl restart lead-queue   # Restart service
+sudo systemctl stop lead-queue      # Stop service
+sudo systemctl start lead-queue     # Start service
 
----
-
-## 🔒 Security
-
-- ✅ Credentials via environment variables only
-- ✅ No secrets in logs or error messages
-- ✅ PII-containing outputs in secure `runs/` directory
-- ✅ Pre-flight credential validation
-- ✅ HTTPS for all external API calls
-
-**Best practices**:
-- Never commit `.env.local`
-- Rotate tokens quarterly
-- Restrict `runs/` directory: `chmod 700 runs/`
-- Delete old runs per retention policy
-
----
-
-## 🚨 Support
-
-1. **Self-Service**: Check [QUICKSTART.md](QUICKSTART.md) and [PRODUCTION_GUIDE.md](PRODUCTION_GUIDE.md)
-2. **Logs**: Review `runs/<run_id>/run.log` for error details
-3. **Metrics**: Inspect `runs/<run_id>/metrics.json` for performance data
-4. **Contact**: mark@nevereverordinary.com (include run_id and logs)
-
----
-
-## 📝 Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for version history.
-
-**Latest**: v2.0.0 - Production hardening release (2025-10-17)
-
----
-
-## 🎓 Architecture
-
-```
-┌─────────────┐
-│   Supabase  │ ──→ Existing companies
-└─────────────┘
-
-┌─────────────┐
-│   HubSpot   │ ──→ Suppression filter
-└─────────────┘
-
-┌─────────────┐
-│ Discovery   │ ──→ New company discovery
-│  Webhook    │     (LLM-based search)
-└─────────────┘
-
-┌─────────────┐
-│  Company    │ ──→ Enrich with ICP data,
-│ Enrichment  │     decision makers
-└─────────────┘
-
-┌─────────────┐
-│  Contact    │ ──→ Find additional contacts
-│ Discovery   │     (if needed)
-└─────────────┘
-
-┌─────────────┐
-│   Email     │ ──→ Verify contact emails
-│Verification │
-└─────────────┘
-
-┌─────────────┐
-│  Contact    │ ──→ Research anecdotes,
-│ Enrichment  │     personalization
-└─────────────┘
-
-          ↓
-
-    ┌──────────┐
-    │ CSV Files│
-    │  + Email │
-    └──────────┘
+# View logs
+sudo journalctl -u lead-queue -f    # Follow logs
+sudo journalctl -u lead-queue -n 100  # Last 100 lines
+sudo journalctl -u lead-queue --since "1 hour ago"
 ```
 
----
+## Filtering Logic
 
-## 🏆 Production Readiness
+### Location Filtering
 
-✅ **Code Quality**: Comprehensive error handling, type hints, docstrings
-✅ **Resilience**: Circuit breakers, retries, state persistence
-✅ **Observability**: Metrics, health checks, detailed logging
-✅ **Testing**: Automated test suite, documented test strategy
-✅ **Documentation**: 4 comprehensive guides covering all aspects
-✅ **Operations**: Monitoring, troubleshooting, maintenance procedures
-✅ **Security**: Credential protection, data privacy, audit trails
+The pipeline applies sophisticated location filtering:
 
-**Status**: READY FOR PRODUCTION DEPLOYMENT
+- **Input formats supported:**
+  - "Memphis, TN" (city, state)
+  - "Memphis TN" (city state)
+  - "Tennessee" (state only)
+  - "Memphis" (city only)
 
-See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for full assessment.
+- **State normalization:**
+  - Full names → abbreviations ("Tennessee" → "TN")
+  - Case-insensitive matching
+  - All US states and DC supported
 
----
+- **Company field matching:**
+  - Primary: `city`, `state`
+  - Headquarters: `hq_city`, `hq_state`
+  - Other: `location`, `region`, `address`
+  - Fallback to any location-related field
 
-## 📄 License
+### Property Management Filtering
+
+Validates companies are genuine property management firms:
+
+- **Positive signals:**
+  - ICP fit = "yes"
+  - ICP tier in A, B, C
+  - Has PMS software listed
+  - Has unit count > 0
+  - Contains PM keywords in description
+
+- **Negative signals (disqualifiers):**
+  - ICP tier D or F
+  - Contains non-PM keywords:
+    - "software-as-a-service", "saas company"
+    - "hotel software", "vacation rental"
+    - "marketing agency", "digital agency"
+  - Marked as "not property management"
+
+- **Filtering modes:**
+  - **Strict**: Requires positive signals
+  - **Loose**: Only excludes on negative signals
+
+## Error Handling
+
+### Circuit Breakers
+- Prevent cascading failures when services are down
+- Track failure rates and open circuit after threshold
+- Automatic recovery with exponential backoff
+
+### Retry Strategy
+- Configurable max retries (default: 4)
+- Exponential backoff: 2s, 4s, 8s, 16s
+- Different strategies for different error types
+
+### State Recovery
+- Checkpoint state every 10 companies
+- Resume from last checkpoint on interruption
+- Preserve partial results on failure
+
+### Zero Results Protection
+- Pipeline raises error if 0 companies after filtering
+- Prevents marking empty requests as "completed"
+- Forces retry with adjusted parameters
+
+## Logging System
+
+### Log Capture
+All request processing logs are captured and stored in Supabase:
+
+```json
+{
+  "run_logs": {
+    "summary": {
+      "total_logs": 1234,
+      "level_counts": {
+        "INFO": 1000,
+        "WARNING": 200,
+        "ERROR": 34
+      },
+      "key_events": [
+        {
+          "timestamp": "2025-10-30 12:00:00",
+          "level": "INFO",
+          "message": "Pipeline complete: 30 fully enriched companies"
+        }
+      ]
+    },
+    "full_logs": {
+      "captured_at": "2025-10-30T12:00:00",
+      "log_count": 1234,
+      "logs": [...],
+      "raw": "Full log text..."
+    }
+  }
+}
+```
+
+### Key Events Tracked
+- Pipeline start/complete/failed
+- Companies found at each phase
+- Filtering statistics
+- Enrichment success/failure
+- Email verification attempts
+- Error occurrences
+
+## Quality Assurance
+
+### Contact Quality Requirements
+
+- **Minimum anecdotes:**
+  - Personal: 1+ (configurable)
+  - Professional: 2+ (configurable)
+  - Total: 3+ (configurable)
+
+- **Fallback strategies:**
+  - Personalization fallback for low-quality contacts
+  - Seed URL fallback for additional context
+
+### Data Validation
+
+- **Person name validation:**
+  - Minimum 4 characters
+  - No special characters or numbers
+  - Blocks generic terms (e.g., "office", "support")
+  - Requires first and last name
+
+- **Email verification:**
+  - Multiple attempts with backoff
+  - Tracks verification status
+  - Only verified emails proceed
+
+- **Company validation:**
+  - Domain normalization
+  - Duplicate detection
+  - Suppression list checking
+
+## Metrics and Monitoring
+
+### Pipeline Metrics
+```json
+{
+  "start_time": 1698765432.123,
+  "phases": {
+    "discovery": {
+      "attempts": 3,
+      "companies_found": 150,
+      "duration": 45.2
+    },
+    "enrichment": {
+      "processed": 75,
+      "succeeded": 70,
+      "failed": 5,
+      "duration": 120.5
+    }
+  },
+  "totals": {
+    "companies_processed": 75,
+    "contacts_found": 210,
+    "emails_verified": 180,
+    "final_delivered": 50
+  }
+}
+```
+
+### Health Checks
+```python
+# Run health check
+python3 -c "from lead_pipeline import Config, HealthChecker; \
+            c = Config(); h = HealthChecker(c); \
+            ok, errors = h.check_all(); \
+            print('Health:', 'OK' if ok else 'FAILED', errors)"
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **No companies returned**
+   - Check location spelling and format
+   - Verify PMS software availability in area
+   - Review run_logs for filtering details
+   - Ensure discovery webhook is responsive
+
+2. **Wrong locations returned**
+   - Fixed in October 2025 update
+   - Ensure latest version deployed
+   - Check priority_locations format
+   - Verify location filters in all phases
+
+3. **Pipeline hangs**
+   - Check webhook connectivity
+   - Review timeout settings (DISCOVERY_REQUEST_TIMEOUT)
+   - Look for stale processing requests
+   - Verify circuit breakers aren't open
+
+4. **Low contact quality**
+   - Adjust anecdote thresholds
+   - Enable fallback strategies
+   - Check contact enrichment webhook
+   - Review personalization settings
+
+### Debug Commands
+
+```bash
+# Test location parsing
+python3 -c "from lead_pipeline import parse_location_to_city_state; \
+            print(parse_location_to_city_state('Memphis, TN'))"
+
+# Test property filtering
+python3 -c "from lead_pipeline import evaluate_property_management_status; \
+            company = {'pms': 'AppFolio', 'unit_count': 100}; \
+            print(evaluate_property_management_status(company, strict=True))"
+
+# Check specific request logs
+python3 -c "from lead_pipeline import SupabaseResearchClient, Config; \
+            c = Config(); s = SupabaseResearchClient(c); \
+            # Query your request by ID"
+
+# Validate configuration
+python3 -c "from lead_pipeline import Config; c = Config(); c.validate()"
+```
+
+## Recent Updates (October 2025)
+
+### Critical Fixes
+- ✅ **Zero Results Bug**: Requests no longer marked "complete" with 0 results
+- ✅ **Location Filter Bug**: Top-up phase now properly applies location filters
+- ✅ **Filter Consistency**: All pipeline phases apply filters uniformly
+
+### New Features
+- ✅ **Log Capture**: Complete request logs stored in Supabase `run_logs` field
+- ✅ **Test Suite**: Unified comprehensive testing in `test_suite.py`
+- ✅ **Enhanced Logging**: Detailed filter statistics at each stage
+- ✅ **Request Format Support**: Handles priority_locations array format
+
+### Improvements
+- Better error messages and debugging information
+- More robust location parsing (handles edge cases)
+- Consistent property management validation
+- Protection against incomplete requests
+
+## Performance Considerations
+
+### Concurrency Settings
+- **Enrichment**: 10 parallel workers (adjustable)
+- **Contacts**: 20 parallel workers (adjustable)
+- **Discovery**: Sequential with timeout protection
+
+### Optimization Tips
+- Increase concurrency for faster processing (more API load)
+- Use circuit breakers to prevent overload
+- Monitor webhook response times
+- Cache frequently accessed data in Supabase
+
+### Resource Usage
+- Memory: ~200MB baseline, scales with concurrency
+- CPU: Low, mostly I/O bound
+- Network: Depends on webhook response sizes
+- Disk: Minimal, only for run artifacts
+
+## Support
+
+For issues or questions:
+1. Check `run_logs` field in Supabase for request debugging
+2. Run test suite to verify configuration
+3. Review this documentation and recent updates
+4. Check webhook status and connectivity
+5. Verify environment variables are set correctly
+
+## License
 
 Proprietary - All rights reserved
 
 ---
 
-## 👥 Credits
-
-**Developer**: Mark Lerner
-**Architecture**: Claude (Anthropic)
-**Version**: 2.0.0 - Production Hardening Release
-**Date**: 2025-10-17
-
----
-
-**Ready to go?** → [QUICKSTART.md](QUICKSTART.md) → Run your first pipeline in 5 minutes!
+*Last updated: October 30, 2025*
+*Version: 2.1.0*

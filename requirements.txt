@@ -1,0 +1,35 @@
+# Lead List Orchestrator - Python Dependencies
+# Python 3.8+ required
+
+# Core dependencies (no external packages required for basic functionality)
+# The pipeline uses only Python standard library modules:
+# - json, csv, logging, argparse, datetime
+# - urllib for HTTP requests
+# - smtplib for email
+# - pathlib for file operations
+# - concurrent.futures for parallel processing
+
+# Optional dependencies for enhanced functionality:
+# (Uncomment if needed for your deployment)
+
+# For advanced HTTP client features:
+# requests>=2.28.0
+
+# For async operations:
+# aiohttp>=3.8.0
+
+# For testing:
+pytest>=7.0.0
+pytest-mock>=3.10.0
+
+# For code quality:
+# black>=22.0.0
+# pylint>=2.15.0
+# mypy>=0.991
+
+# Note: The core pipeline is designed to work without external dependencies
+# to minimize deployment complexity and security surface area.
+
+# For request splitting with LLM (required for large requests > 10 companies):
+anthropic>=0.18.0
+openai>=0.28.0

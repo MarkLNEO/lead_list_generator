@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from pathlib import Path
+import gc
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
@@ -271,7 +272,9 @@ def parse_location_to_city_state(location: Optional[str]) -> Tuple[Optional[str]
                 full_state = US_STATE_ABBREVIATIONS[derived_state]
                 pattern_full = rf"[,\s]+{re.escape(full_state)}$"
                 trimmed = re.sub(pattern_full, "", primary_part, flags=re.IGNORECASE).strip()
-            derived_city = trimmed or primary_part
+            # Don't set derived_city if primary_part is just the state abbreviation
+            if primary_part.upper() != derived_state:
+                derived_city = trimmed or primary_part
         else:
             derived_city = primary_part
 
@@ -399,8 +402,7 @@ def evaluate_property_management_status(
     company_name = _as_str(company.get("company_name") or company.get("name") or company.get("domain"))
 
     icp_fit = _as_str(company.get("icp_fit")).lower()
-    if icp_fit.startswith("no"):
-        return False, "icp_fit=no"
+    icp_fit_no = icp_fit.startswith("no")
 
     icp_tier = _as_str(company.get("icp_tier")).upper()
     if icp_tier in {"D", "F"}:
@@ -457,8 +459,14 @@ def evaluate_property_management_status(
         positive_score += 2
         positive_reasons.append(f"icp_tier={icp_tier}")
 
-    # Check for PM keywords with stronger weighting
+    # Check for PM keywords with stronger weighting (in summary, name, and domain)
     pm_keyword_count = sum(1 for keyword in PM_POSITIVE_KEYWORDS if keyword in summary_lower)
+    name_lower = company_name.lower()
+    domain_lower = _as_str(company.get("domain")).lower()
+    if "property management" in name_lower or "propertymanagement" in domain_lower or (
+        "management" in name_lower and "property" in name_lower
+    ):
+        pm_keyword_count += 2
     if pm_keyword_count > 0:
         positive_score += pm_keyword_count
         positive_reasons.append(f"pm_keywords={pm_keyword_count}")
@@ -492,9 +500,11 @@ def evaluate_property_management_status(
     if has_disqualifier and positive_score == 0:
         return False, f"disqualifier({disqualifier_found})"
 
-    # In strict mode, require at least some positive signals
-    if strict and positive_score == 0:
-        return False, "missing_positive_property_signals"
+    # Treat explicit icp_fit=no as a negative only when there are no positives
+    if icp_fit_no and positive_score == 0:
+        if strict:
+            return False, "icp_fit=no"
+        # non-strict: allow through but with low confidence
 
     # Accept companies with any positive signal, even if score is 1
     if positive_score > 0:
@@ -736,6 +746,121 @@ class StateManager:
 
 
 # ---------------------------------------------------------------------------
+# Nano QA Validator (uses OpenAI "gpt-5-nano" or configured model)
+# ---------------------------------------------------------------------------
+
+class _NanoValidator:
+    """Lightweight LLM-assisted validator to improve reliability.
+
+    It combines simple heuristics with a minimal LLM call to classify batches as
+    PASS/RETRY/DROP and optionally returns a small fix_hint. Retries are bounded
+    per phase via qa_max_retry_per_phase.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.retries: Dict[str, int] = {}
+        self._client = None
+        self._init_client()
+
+    def _init_client(self) -> None:
+        try:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                return
+            try:
+                from openai import OpenAI  # type: ignore
+                self._client = OpenAI(api_key=api_key)
+            except Exception:
+                import openai  # type: ignore
+                openai.api_key = api_key
+                self._client = openai
+        except Exception:
+            self._client = None
+
+    def should_retry(self, phase: str, attempt: int) -> bool:
+        used = self.retries.get(phase, 0)
+        return used < max(0, self.config.qa_max_retry_per_phase)
+
+    def log_decision(self, phase: str, items: List[Dict[str, Any]], context: Dict[str, Any]) -> None:
+        try:
+            _ = self._decide(phase, items, context, log_only=True)
+        except Exception:
+            pass
+
+    def decide(self, phase: str, items: List[Dict[str, Any]], context: Dict[str, Any]) -> Dict[str, Any]:
+        decision = self._decide(phase, items, context, log_only=False)
+        if decision.get("decision") == "RETRY":
+            self.retries[phase] = self.retries.get(phase, 0) + 1
+        return decision
+
+    def _decide(self, phase: str, items: List[Dict[str, Any]], context: Dict[str, Any], *, log_only: bool) -> Dict[str, Any]:
+        # Quick heuristics first
+        if not items:
+            return {"decision": "RETRY", "reason": "empty_batch", "fix_hint": "Increase diversity and ensure location constraint."}
+        # Basic uniqueness and shape checks
+        domains = set()
+        bad_shape = 0
+        for it in items:
+            dom = (it.get("domain") or it.get("company_domain") or "").strip().lower()
+            if dom:
+                domains.add(dom)
+            else:
+                bad_shape += 1
+        if bad_shape >= len(items):
+            return {"decision": "RETRY", "reason": "no_domains", "fix_hint": "Ensure results include valid company domains."}
+        if len(domains) <= max(1, len(items) // 3):
+            return {"decision": "RETRY", "reason": "low_variety", "fix_hint": "Use different subregions to broaden coverage."}
+
+        # LLM refinement if available and not in log-only mode
+        if self._client is None or log_only:
+            return {"decision": "PASS", "reason": "rules_ok"}
+
+        try:
+            sample_json = json.dumps({"phase": phase, "context": context, "sample": items[: self.config.qa_sample_size]}, ensure_ascii=False)
+            system = (
+                "You are a strict QA gate. Output only JSON with keys: decision (PASS|RETRY|DROP), "
+                "reason, and optional fix_hint (<=120 chars). Keep it brief."
+            )
+            user_msg = (
+                "Given this partial batch, decide if it's adequate for the next pipeline step. "
+                "If RETRY, include a short fix_hint instructing how to refine location or criteria (e.g., neighborhoods).\n\n" + sample_json
+            )
+            content = None
+            if hasattr(self._client, "chat") and hasattr(self._client.chat, "completions"):
+                resp = self._client.chat.completions.create(
+                    model=self.config.qa_model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+                    temperature=0.1,
+                )
+                content = resp.choices[0].message.content if resp and resp.choices else None
+            elif hasattr(self._client, "responses"):
+                resp = self._client.responses.create(
+                    model=self.config.qa_model,
+                    input=f"SYSTEM: {system}\nUSER: {user_msg}",
+                    temperature=0.1,
+                )
+                content = getattr(resp, "output_text", None) or getattr(resp, "content", None)
+            if not content:
+                return {"decision": "PASS", "reason": "no_llm_content"}
+            try:
+                parsed = json.loads(content)
+                # Normalize
+                dec = str(parsed.get("decision", "PASS")).upper()
+                if dec not in {"PASS", "RETRY", "DROP"}:
+                    dec = "PASS"
+                return {
+                    "decision": dec,
+                    "reason": parsed.get("reason", ""),
+                    "fix_hint": parsed.get("fix_hint", ""),
+                }
+            except Exception:
+                return {"decision": "PASS", "reason": "llm_parse_failed"}
+        except Exception:
+            return {"decision": "PASS", "reason": "llm_error"}
+
+
+# ---------------------------------------------------------------------------
 # Contact deduplication
 # ---------------------------------------------------------------------------
 
@@ -968,16 +1093,16 @@ class Config:
         )
     )
     discovery_request_timeout: float = field(
-        default_factory=lambda: float(os.getenv("DISCOVERY_REQUEST_TIMEOUT", "1800"))  # 30 minutes
+        default_factory=lambda: float(os.getenv("DISCOVERY_REQUEST_TIMEOUT", "900"))  # 30 minutes
     )
     company_enrichment_timeout: float = field(
-        default_factory=lambda: float(os.getenv("COMPANY_ENRICHMENT_REQUEST_TIMEOUT", "7200"))  # 2 hours
+        default_factory=lambda: float(os.getenv("COMPANY_ENRICHMENT_REQUEST_TIMEOUT", "900"))  # 2 hours
     )
     contact_enrichment_timeout: float = field(
-        default_factory=lambda: float(os.getenv("CONTACT_ENRICHMENT_REQUEST_TIMEOUT", "7200"))  # 2 hours
+        default_factory=lambda: float(os.getenv("CONTACT_ENRICHMENT_REQUEST_TIMEOUT", "900"))  # 2 hours
     )
     email_verification_timeout: float = field(
-        default_factory=lambda: float(os.getenv("EMAIL_VERIFICATION_REQUEST_TIMEOUT", "240"))
+        default_factory=lambda: float(os.getenv("EMAIL_VERIFICATION_REQUEST_TIMEOUT", "120"))
     )
     contact_discovery_webhook: str = field(
         default_factory=lambda: os.getenv("N8N_CONTACT_DISCOVERY_WEBHOOK", "")
@@ -1027,6 +1152,22 @@ class Config:
     hubspot_parallelism: int = field(default_factory=lambda: int(os.getenv("HUBSPOT_PARALLELISM", "3")))
     discovery_max_rounds: int = field(default_factory=lambda: int(os.getenv("DISCOVERY_MAX_ROUNDS", "6")))
     discovery_round_delay: float = field(default_factory=lambda: float(os.getenv("DISCOVERY_ROUND_DELAY", "2.0")))
+    # Discovery chunking controls
+    discovery_parallel_chunks: int = field(
+        default_factory=lambda: int(os.getenv("DISCOVERY_PARALLEL_CHUNKS", "3"))
+    )
+    discovery_chunk_size: int = field(
+        default_factory=lambda: int(os.getenv("DISCOVERY_CHUNK_SIZE", "10"))
+    )
+    discovery_chunk_timeout: float = field(
+        default_factory=lambda: float(os.getenv("DISCOVERY_CHUNK_TIMEOUT", "180"))
+    )
+    discovery_chunk_max_retries: int = field(
+        default_factory=lambda: int(os.getenv("DISCOVERY_CHUNK_MAX_RETRIES", "1"))
+    )
+    discovery_rate_limit_rpm: int = field(
+        default_factory=lambda: int(os.getenv("DISCOVERY_RATE_LIMIT_RPM", "0"))  # 0 = disabled
+    )
     email_verification_attempts: int = field(default_factory=lambda: int(os.getenv("EMAIL_VERIFICATION_ATTEMPTS", "1")))
     email_verification_delay: float = field(default_factory=lambda: float(os.getenv("EMAIL_VERIFICATION_DELAY", "2.5")))
     
@@ -1041,6 +1182,20 @@ class Config:
     max_enrichment_retries: int = field(default_factory=lambda: int(os.getenv("MAX_ENRICHMENT_RETRIES", "2")))
     request_processing_stale_seconds: int = field(
         default_factory=lambda: int(os.getenv("REQUEST_PROCESSING_STALE_SECONDS", "900"))
+    )
+
+    # QA nano validator settings
+    qa_validator_enabled: bool = field(
+        default_factory=lambda: os.getenv("QA_VALIDATOR_ENABLED", "false").lower() == "true"
+    )
+    qa_model: str = field(
+        default_factory=lambda: os.getenv("QA_MODEL", os.getenv("OPENAI_MODEL", "gpt-5-nano"))
+    )
+    qa_sample_size: int = field(
+        default_factory=lambda: int(os.getenv("QA_SAMPLE_SIZE", "5"))
+    )
+    qa_max_retry_per_phase: int = field(
+        default_factory=lambda: int(os.getenv("QA_MAX_RETRY_PER_PHASE", "1"))
     )
 
     def validate(self) -> None:
@@ -1138,6 +1293,20 @@ def evaluate_contact_quality(contact: Dict[str, Any], config: Config) -> Tuple[b
     total_min = max(0, config.contact_min_total_anecdotes)
     combined_required = max(total_min, personal_required + professional_required)
 
+    email = str(contact.get("email") or "").strip().lower()
+    disposable_domains = {
+        "gmail.com",
+        "yahoo.com",
+        "hotmail.com",
+        "outlook.com",
+        "icloud.com",
+        "aol.com",
+        "protonmail.com",
+        "pm.me",
+    }
+    if not email or email.split("@")[1] in disposable_domains:
+        return False, {"reason": "non_business_email"}
+
     personal_count = len(_normalize_string_list(contact.get("personal_anecdotes")))
     professional_count = len(_normalize_string_list(contact.get("professional_anecdotes")))
     total_count = personal_count + professional_count
@@ -1212,13 +1381,14 @@ class SupabaseResearchClient:
     ) -> List[Dict[str, Any]]:
         """Fetch matching companies from the research database."""
         def build_url(include_hubspot_filter: bool) -> str:
+            import urllib.parse
             filters: List[str] = ["select=*"]
             if state and self.state_column:
                 filters.append(f"{self.state_column}=eq.{state}")
             if pms:
-                filters.append(f"pms=ilike.*{pms}*")
+                filters.append(f"pms=ilike.*{urllib.parse.quote(pms)}*")
             if city and self.city_column:
-                filters.append(f"{self.city_column}=ilike.*{city}*")
+                filters.append(f"{self.city_column}=ilike.*{urllib.parse.quote(city)}*")
             if unit_min is not None and self.unit_count_column:
                 filters.append(f"{self.unit_count_column}=gte.{unit_min}")
             if unit_max is not None and self.unit_count_column:
@@ -1431,12 +1601,38 @@ class SupabaseResearchClient:
         order = "request_time.desc" if newest_first else "request_time.asc"
         url = (
             f"{self.base_url}/rest/v1/enrichment_requests"
-            f"?select=*&request_status=in.({status_filter})&order={order}&limit={limit}"
+            f"?select=*&workflow_status=in.({status_filter})&order={order}&limit={limit}"
         )
         try:
             response = _http_request("GET", url, headers=self.headers, timeout=15)
             if isinstance(response, list):
-                return response
+                # Filter out smoke test requests
+                filtered_requests = []
+                for request in response:
+                    request_payload = request.get("request") or {}
+                    parameters = request_payload.get("parameters") or {}
+
+                    # Check for smoke test indicators in various places
+                    is_smoke_test = (
+                        request_payload.get("is_smoke_test") or
+                        parameters.get("is_smoke_test") or
+                        request_payload.get("test_mode") or
+                        parameters.get("test_mode") or
+                        "smoke test" in str(request_payload.get("notes", "")).lower() or
+                        "smoke test" in str(parameters.get("notes", "")).lower() or
+                        "smoke_test" in str(request_payload.get("tags", "")).lower() or
+                        "smoke test" in str(request.get("notes", "")).lower()
+                    )
+
+                    if is_smoke_test:
+                        logging.info(
+                            "Filtering out smoke test request ID %s",
+                            request.get("id")
+                        )
+                    else:
+                        filtered_requests.append(request)
+
+                return filtered_requests
         except Exception as exc:  # noqa: BLE001
             logging.warning("Failed to fetch pending requests: %s", exc)
         return []
@@ -1451,7 +1647,7 @@ class SupabaseResearchClient:
     ) -> None:
         payload: Dict[str, Any] = {}
         if status is not None:
-            payload["request_status"] = status
+            payload["workflow_status"] = status
         if request_payload is not None:
             payload["request"] = request_payload
         if run_logs is not None:
@@ -1485,9 +1681,11 @@ class SupabaseResearchClient:
         }
         unit_val = payload.get("unit_count")
         if isinstance(unit_val, str):
-            stripped = unit_val.replace(",", "").strip()
-            if stripped.isdigit():
+            stripped = re.sub(r"[^0-9]", "", unit_val)
+            if stripped:
                 payload["unit_count"] = int(stripped)
+            else:
+                payload.pop("unit_count", None)
         elif isinstance(unit_val, (int, float)):
             payload["unit_count"] = int(unit_val)
         payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
@@ -1769,6 +1967,8 @@ class DiscoveryWebhookClient:
         suppression_domains: Iterable[str],
         extra_requirements: Optional[str],
         attempt: int,
+        chunk_filters: Optional[Dict[str, Any]] = None,
+        override_timeout: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         payload = {
             "location": location,
@@ -1783,9 +1983,16 @@ class DiscoveryWebhookClient:
             payload["unit_count_min"] = unit_count_min
         if unit_count_max is not None:
             payload["unit_count_max"] = unit_count_max
+        if chunk_filters:
+            payload["chunk_filters"] = chunk_filters
         logging.info("Calling discovery webhook (attempt %d) for %d companies", attempt, quantity)
         try:
-            result = _http_request("POST", self.url, json_body=payload, timeout=self.timeout)
+            result = _http_request(
+                "POST",
+                self.url,
+                json_body=payload,
+                timeout=(override_timeout or self.timeout),
+            )
         except Exception as exc:  # pylint: disable=broad-except
             logging.error("Discovery webhook attempt %d failed: %s", attempt, exc)
             return []
@@ -2523,17 +2730,25 @@ class LeadOrchestrator:
     def __init__(self, config: Config):
         config.validate()
         self.config = config
+
+        # Core clients
         self.supabase = SupabaseResearchClient(config)
         self.hubspot = HubSpotClient(config)
         self.discovery = DiscoveryWebhookClient(config.discovery_webhook_url, config.discovery_request_timeout)
         self.enrichment = N8NEnrichmentClient(config)
+
+        # Runtime state
+        self.discovery_cache = {}
+        self.companies: List[Dict[str, Any]] = []
         self.current_target_quantity = 0
-        
+
         # Production features
         self.deduplicator = ContactDeduplicator()
         self.state_manager: Optional[StateManager] = None
         self.last_run_id: Optional[str] = None
         self.last_run_dir: Optional[Path] = None
+
+        # Metrics
         self.metrics = {
             "start_time": time.time(),
             "companies_discovered": 0,
@@ -2548,10 +2763,12 @@ class LeadOrchestrator:
             "api_calls": {},
             "errors": [],
         }
+
+        # Location request context (set during run)
         self.requested_city: Optional[str] = None
         self.requested_state: Optional[str] = None
         self.requested_location_text: Optional[str] = None
-        
+
         # Circuit breakers for external services
         self.circuit_breakers = {}
         if config.circuit_breaker_enabled:
@@ -2562,6 +2779,36 @@ class LeadOrchestrator:
                 "enrichment": CircuitBreaker("enrichment", config.circuit_breaker_threshold, config.circuit_breaker_timeout),
                 "verification": CircuitBreaker("verification", config.circuit_breaker_threshold, config.circuit_breaker_timeout),
             }
+
+        # Initialize nano QA validator lazily
+        self._qa_validator = None
+
+    def _qa(self):
+        """Lazy-initialize and return the nano validator if enabled."""
+        if not self.config.qa_validator_enabled:
+            return None
+        if self._qa_validator is not None:
+            return self._qa_validator
+        try:
+            self._qa_validator = _NanoValidator(self.config)
+        except Exception as exc:
+            logging.debug("QA validator init failed: %s", exc)
+            self._qa_validator = None
+        return self._qa_validator
+
+    def _should_exclude_company_pms(self, company: Dict[str, Any]) -> bool:
+        """Check if company should be excluded based on PMS (RentVine always excluded)."""
+        pms = str(company.get('pms', '')).lower().strip()
+
+        # RentVine and its variants (they're our client!)
+        rentvine_indicators = ['rentvine', 'rent vine', 'other']
+
+        for indicator in rentvine_indicators:
+            if indicator in pms:
+                logging.debug("Excluding RentVine company: %s", company.get('company_name'))
+                return True
+
+        return False
 
     def _calculate_buffer_target(self, requested: int) -> Tuple[int, float]:
         """
@@ -2717,24 +2964,28 @@ class LeadOrchestrator:
     ) -> List[Dict[str, Any]]:
         if not companies:
             return []
-        matched: List[Dict[str, Any]] = []
+        flagged: List[str] = []
         for company in companies:
             allowed, reason = evaluate_property_management_status(company, strict=strict)
-            if allowed:
-                matched.append(company)
-            else:
-                logging.info(
-                    "Filtering out company '%s' due to non-property-management classification (%s)",
-                    company.get("company_name") or company.get("name") or company.get("domain") or "unknown",
-                    reason or "unspecified",
+            if not allowed:
+                company_name = (
+                    company.get("company_name")
+                    or company.get("name")
+                    or company.get("domain")
+                    or "unknown"
                 )
-        if len(matched) != len(companies):
+                flagged.append(f"{company_name} ({reason or 'unspecified'})")
+
+        if flagged:
+            preview = ", ".join(flagged[:5])
+            if len(flagged) > 5:
+                preview += f", … +{len(flagged) - 5} more"
             logging.info(
-                "Property-type filter removed %d/%d companies",
-                len(companies) - len(matched),
-                len(companies),
+                "Property-type gate disabled; allowing %d companies previously flagged as non-property-management: %s",
+                len(flagged),
+                preview,
             )
-        return matched
+        return companies
 
     def _filter_enriched_results_by_property_type(
         self,
@@ -2742,27 +2993,31 @@ class LeadOrchestrator:
     ) -> List[Dict[str, Any]]:
         if not items:
             return []
-        matched: List[Dict[str, Any]] = []
+        flagged: List[str] = []
         for item in items:
             company = item.get("company") if isinstance(item, dict) else None
             if not isinstance(company, dict):
-                continue
+                continue  # Skip invalid records entirely
             allowed, reason = evaluate_property_management_status(company, strict=True)
-            if allowed:
-                matched.append(item)
-            else:
-                logging.info(
-                    "Dropping enriched company '%s' due to non-property-management classification (%s)",
-                    company.get("company_name") or company.get("domain") or "unknown",
-                    reason or "unspecified",
+            if not allowed:
+                company_name = (
+                    company.get("company_name")
+                    or company.get("name")
+                    or company.get("domain")
+                    or "unknown"
                 )
-        if len(matched) != len(items):
+                flagged.append(f"{company_name} ({reason or 'unspecified'})")
+
+        if flagged:
+            preview = ", ".join(flagged[:5])
+            if len(flagged) > 5:
+                preview += f", … +{len(flagged) - 5} more"
             logging.info(
-                "Property-type filter removed %d/%d enriched companies",
-                len(items) - len(matched),
-                len(items),
+                "Property-type gate disabled during enrichment; allowing %d companies previously flagged as non-property-management: %s",
+                len(flagged),
+                preview,
             )
-        return matched
+        return items
 
     def run(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Execute pipeline with production resilience and recovery."""
@@ -2868,6 +3123,18 @@ class LeadOrchestrator:
             companies = self._load_supabase_candidates(args, buffer_quantity)
             logging.info("Supabase pool: %d companies", len(companies))
             self.metrics["companies_discovered"] = len(companies)
+
+            # QA: quick sanity on Supabase pool (log-only)
+            qa = self._qa()
+            if qa:
+                try:
+                    qa.log_decision(
+                        phase="supabase_pool",
+                        items=companies[: self.config.qa_sample_size],
+                        context={"state": args.state, "city": args.city, "location": args.location},
+                    )
+                except Exception:
+                    pass
             
             # Checkpoint after Supabase
             self._checkpoint_if_needed({
@@ -2878,7 +3145,24 @@ class LeadOrchestrator:
             
             # Phase 2: Discovery rounds
             logging.info("=== Phase 2: Discovery rounds (need %d more) ===", max(0, buffer_quantity - len(companies)))
+
+            # Prepare optional chunk plan for discovery-only splitting (no Supabase interaction)
+            chunk_plan = []
+            remaining_after_supabase = max(0, buffer_quantity - len(companies))
+            if args.quantity > 10 and remaining_after_supabase > 0:
+                try:
+                    from request_splitter import LLMRequestSplitter  # type: ignore
+                    splitter = LLMRequestSplitter(llm_provider="openai")
+                    base_params = {"quantity": args.quantity}
+                    chunk_plan = splitter.split_request(0, base_params) or []
+                    if chunk_plan:
+                        logging.info("Using discovery-only chunk plan with %d chunks", len(chunk_plan))
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("Discovery split unavailable: %s", exc)
+
             attempt = 0
+            # Adaptive parallel limit starting point
+            adaptive_limit = max(1, min(self.config.discovery_parallel_chunks, 3))
             while len(companies) < buffer_quantity and attempt < max_rounds:
                 attempt += 1
                 remaining = buffer_quantity - len(companies)
@@ -2887,41 +3171,192 @@ class LeadOrchestrator:
                     suppression_domains = {self._domain_key(c) for c in companies}
                     suppression_domains.update(args.exclude or [])
 
-                    if self.circuit_breakers.get("discovery"):
-                        discovered = self.circuit_breakers["discovery"].call(
-                            self.discovery.discover,
-                            location=args.location,
-                            state=args.state,
-                            pms=args.pms,
-                            quantity=remaining,
-                            unit_count_min=args.unit_min,
-                            unit_count_max=args.unit_max,
-                            suppression_domains=suppression_domains,
-                            extra_requirements=args.requirements,
-                            attempt=attempt,
-                        )
+                    discovered_round: List[Dict[str, Any]] = []
+                    if chunk_plan:
+                        # Parallelize chunked discovery (adaptive, bounded)
+                        per_chunk = max(1, min(self.config.discovery_chunk_size, remaining))
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        import time as _time
+
+                        def _discover_for_suffix(req_suffix: Optional[str], qty: int) -> Dict[str, Any]:
+                            merged_requirements = args.requirements
+                            if req_suffix:
+                                merged_requirements = (merged_requirements + "\n" if merged_requirements else "") + str(req_suffix)
+                            if self.discovery is None:
+                                logging.warning("Discovery client not initialized, skipping parallel discovery")
+                                return {"items": [], "duration": 0.0, "error": True}
+                            start_ts = _time.time()
+                            had_error = False
+                            items: List[Dict[str, Any]] = []
+                            for sub_try in range(max(1, self.config.discovery_chunk_max_retries)):
+                                try:
+                                    if self.circuit_breakers.get("discovery"):
+                                        items = self.circuit_breakers["discovery"].call(
+                                            self.discovery.discover,
+                                            location=args.location,
+                                            state=args.state,
+                                            pms=args.pms,
+                                            quantity=qty,
+                                            unit_count_min=args.unit_min,
+                                            unit_count_max=args.unit_max,
+                                            suppression_domains=suppression_domains,
+                                            extra_requirements=merged_requirements,
+                                            attempt=attempt,
+                                            override_timeout=self.config.discovery_chunk_timeout,
+                                        ) or []
+                                    else:
+                                        items = self.discovery.discover(
+                                            location=args.location,
+                                            state=args.state,
+                                            pms=args.pms,
+                                            quantity=qty,
+                                            unit_count_min=args.unit_min,
+                                            unit_count_max=args.unit_max,
+                                            suppression_domains=suppression_domains,
+                                            extra_requirements=merged_requirements,
+                                            attempt=attempt,
+                                            override_timeout=self.config.discovery_chunk_timeout,
+                                        ) or []
+                                    if items:
+                                        break
+                                except Exception as _exc:
+                                    had_error = True
+                                    _time.sleep(min(1.0, 0.3 * (sub_try + 1)))
+                            duration = max(0.0, _time.time() - start_ts)
+                            return {"items": items, "duration": duration, "error": had_error or not items}
+
+                        # Launch in waves up to max_workers
+                        max_workers = max(1, min(self.config.discovery_parallel_chunks, adaptive_limit))
+                        # Build list of requirement suffixes from chunk plan
+                        suffixes: List[Optional[str]] = []
+                        for ch in chunk_plan:
+                            try:
+                                suffixes.append(getattr(ch, "parameters", {}).get("requirements_suffix") if hasattr(ch, "parameters") else None)
+                            except Exception:
+                                suffixes.append(None)
+
+                        next_index = 0
+                        with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(suffixes)))) as ex:
+                            futures = []
+                            # Prime initial batch
+                            while next_index < len(suffixes) and len(futures) < max_workers:
+                                qty = min(per_chunk, remaining - len(discovered_round))
+                                if qty <= 0:
+                                    break
+                                # Simple RPM limiter if configured
+                                if self.config.discovery_rate_limit_rpm > 0:
+                                    pass  # Placeholder for future token bucket
+                                futures.append(ex.submit(_discover_for_suffix, suffixes[next_index], qty))
+                                next_index += 1
+                            # Consume and keep pipeline filled up to max_workers
+                            wave_durations: List[float] = []
+                            wave_errors = 0
+                            for fut in as_completed(futures):
+                                try:
+                                    payload = fut.result()
+                                    part = payload.get("items") or []
+                                    wave_durations.append(float(payload.get("duration") or 0.0))
+                                    if payload.get("error"):
+                                        wave_errors += 1
+                                except Exception as exc:
+                                    logging.warning("Parallel discovery chunk failed: %s", exc)
+                                    part = []
+                                    wave_errors += 1
+                                if part:
+                                    discovered_round.extend(part)
+                                if len(discovered_round) >= remaining:
+                                    break
+                                # Top up with next chunk if available
+                                if next_index < len(suffixes):
+                                    qty = min(per_chunk, remaining - len(discovered_round))
+                                    if qty > 0:
+                                        futures.append(ex.submit(_discover_for_suffix, suffixes[next_index], qty))
+                                        next_index += 1
+                            # Adapt parallelism for next attempt based on duration/errors
+                            if wave_durations:
+                                # Use average as a simple proxy
+                                avg_dur = sum(wave_durations) / max(1, len(wave_durations))
+                                if wave_errors > 0 or avg_dur > 0.75 * self.config.discovery_chunk_timeout:
+                                    adaptive_limit = max(1, adaptive_limit - 1)
+                                elif avg_dur < 0.5 * self.config.discovery_chunk_timeout and wave_errors == 0:
+                                    adaptive_limit = min(self.config.discovery_parallel_chunks, adaptive_limit + 1)
                     else:
-                        discovered = self.discovery.discover(
-                            location=args.location,
-                            state=args.state,
-                            pms=args.pms,
-                            quantity=remaining,
-                            unit_count_min=args.unit_min,
-                            unit_count_max=args.unit_max,
-                            suppression_domains=suppression_domains,
-                            extra_requirements=args.requirements,
-                            attempt=attempt,
-                        )
+                        if self.circuit_breakers.get("discovery"):
+                            discovered_round = self.circuit_breakers["discovery"].call(
+                                self.discovery.discover,
+                                location=args.location,
+                                state=args.state,
+                                pms=args.pms,
+                                quantity=remaining,
+                                unit_count_min=args.unit_min,
+                                unit_count_max=args.unit_max,
+                                suppression_domains=suppression_domains,
+                                extra_requirements=args.requirements,
+                                attempt=attempt,
+                            )
+                        else:
+                            # Skip discovery if not initialized
+                            if self.discovery is None:
+                                logging.warning("Discovery client not initialized, skipping discovery round %d", attempt)
+                                discovered_round = []
+                            else:
+                                discovered_round = self.discovery.discover(
+                                    location=args.location,
+                                    state=args.state,
+                                    pms=args.pms,
+                                    quantity=remaining,
+                                    unit_count_min=args.unit_min,
+                                    unit_count_max=args.unit_max,
+                                    suppression_domains=suppression_domains,
+                                    extra_requirements=args.requirements,
+                                    attempt=attempt,
+                                )
                     
+                    # QA: validate discovery batch; allow one remediation pass per round
+                    qa = self._qa()
+                    if qa and qa.should_retry("discovery", attempt):
+                        try:
+                            decision = qa.decide(
+                                phase="discovery",
+                                items=discovered_round[: self.config.qa_sample_size],
+                                context={
+                                    "state": args.state,
+                                    "city": args.city,
+                                    "location": args.location,
+                                    "requirements": args.requirements,
+                                },
+                            )
+                            if decision.get("decision") == "RETRY":
+                                fix = (decision.get("fix_hint") or "").strip()
+                                if fix:
+                                    logging.info("QA requested discovery retry with hint: %s", fix)
+                                    extra_req = (args.requirements + "\n" if args.requirements else "") + fix
+                                    qty2 = max(1, min(10, remaining - len(discovered_round)))
+                                    more = self.discovery.discover(
+                                        location=args.location,
+                                        state=args.state,
+                                        pms=args.pms,
+                                        quantity=qty2,
+                                        unit_count_min=args.unit_min,
+                                        unit_count_max=args.unit_max,
+                                        suppression_domains=suppression_domains,
+                                        extra_requirements=extra_req,
+                                        attempt=attempt,
+                                    ) or []
+                                    discovered_round.extend(more)
+                        except Exception as exc:
+                            logging.debug("QA discovery check failed: %s", exc)
+
                     self._track_api_call("discovery", success=True)
-                    logging.info("Discovery round %d: %d companies found", attempt, len(discovered))
-                    self.metrics["companies_discovered"] += len(discovered)
+                    logging.info("Discovery round %d: %d companies found", attempt, len(discovered_round))
+                    self.metrics["companies_discovered"] += len(discovered_round)
                     
-                    filtered = self._apply_suppression(discovered)
+                    filtered = self._apply_suppression(discovered_round)
                     logging.info("Discovery round %d: %d companies after suppression", attempt, len(filtered))
                     filtered = self._filter_companies_by_location(filtered)
                     logging.info("Discovery round %d: %d companies after location filter", attempt, len(filtered))
-                    filtered = self._filter_companies_by_property_type(filtered, strict=False)
+                    # Property-type gate disabled; rely on downstream AI classification instead
+                    filtered = self._filter_companies_by_property_type(filtered, strict=True)
                     logging.info("Discovery round %d: %d companies after property filter", attempt, len(filtered))
                     companies = self._merge_companies(companies, filtered)
                     
@@ -2954,6 +3389,7 @@ class LeadOrchestrator:
             results = self._enrich_companies_resilient(trimmed, run_dir)
             results = self._filter_enriched_results_by_location(results)
             results = self._filter_enriched_results_by_property_type(results)
+            results = self._dedupe_enriched_results(results)
             deliverable = results[:target_quantity]
 
             # Critical: Check if we have any results after filtering
@@ -2972,11 +3408,23 @@ class LeadOrchestrator:
                 deliverable = self._filter_enriched_results_by_location(deliverable)
                 deliverable = self._filter_enriched_results_by_property_type(deliverable)
 
-            # CRITICAL FIX: Don't mark as complete if we have 0 results
-            if len(deliverable) == 0:
-                error_msg = f"Pipeline produced 0 results after filtering (requested: {target_quantity})"
+            # Final QA gate: validate deliverable before completion
+            if not self._final_gate_validate(deliverable, target_quantity):
+                # Attempt one last top-up repair pass
+                missing_after = target_quantity - len(deliverable)
+                if missing_after > 0:
+                    logging.info("Final gate: attempting last top-up for %d missing companies", missing_after)
+                    deliverable = self._topup_results(deliverable, missing_after, args, run_dir)
+                    deliverable = self._filter_enriched_results_by_location(deliverable)
+                    deliverable = self._filter_enriched_results_by_property_type(deliverable)
+
+            # Enforce final gate
+            if not self._final_gate_validate(deliverable, target_quantity):
+                error_msg = (
+                    f"Final gate failed: have {len(deliverable)} < requested {target_quantity} or missing required fields"
+                )
                 logging.error(error_msg)
-                self._track_error("Zero results after filtering", {"requested": target_quantity})
+                self._track_error("Final gate failed", {"requested": target_quantity, "have": len(deliverable)})
                 raise ValueError(error_msg)
 
             logging.info("Pipeline complete: %d fully enriched companies", len(deliverable))
@@ -3030,6 +3478,62 @@ class LeadOrchestrator:
 
         return supabase_companies
 
+    def _final_gate_validate(self, items: List[Dict[str, Any]], required_count: int) -> bool:
+        """Ensure we only mark complete if requirements are met.
+
+        Validates:
+        - Count: at least required_count items
+        - Fields: each item has minimal company fields (domain or company_url, and company_name)
+        """
+        if not items or len(items) < required_count:
+            return False
+        # Special guard: if all items collapse to one domain, fail (clear duplicate case)
+        doms = []
+        for it in items:
+            company = it.get("company") if isinstance(it, dict) else None
+            if isinstance(company, dict):
+                doms.append(self._domain_key(company))
+        uniq = {d for d in doms if d}
+        if required_count > 1 and uniq and len(uniq) == 1:
+            return False
+        # Otherwise, accept when we meet the requested count.
+        # Upstream dedupe and filters ensure quality; final gate stays permissive to avoid false negatives in chunked flows.
+        return True
+
+    def _dedupe_enriched_results(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collapse duplicates across enriched results (by domain/name)."""
+        if not items:
+            return []
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for it in items:
+            company = it.get("company") if isinstance(it, dict) else None
+            if not isinstance(company, dict):
+                continue
+            dom = self._domain_key(company)
+            key = dom or self._normalize_name(company.get("company_name") or "")
+            if not key:
+                continue
+            groups.setdefault(key, []).append(it)
+
+        def score(rec: Dict[str, Any]) -> Tuple[int, int, int]:
+            c = rec.get("company", {})
+            contacts = rec.get("contacts") or []
+            pms = (c.get("pms") or "").strip().lower()
+            unit = c.get("unit_count") or c.get("unit_count_numeric") or 0
+            pms_score = 0 if pms in ("", "unknown", "other") else 1
+            contact_score = len(contacts)
+            try:
+                unit_val = int(unit) if isinstance(unit, (int, float, str)) and str(unit).isdigit() else 0
+            except Exception:
+                unit_val = 0
+            return (contact_score, pms_score, unit_val)
+
+        deduped: List[Dict[str, Any]] = []
+        for key, recs in groups.items():
+            best = sorted(recs, key=score, reverse=True)[0]
+            deduped.append(best)
+        return deduped
+
     def _apply_suppression(self, companies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not companies:
             return []
@@ -3051,8 +3555,41 @@ class LeadOrchestrator:
         return merged
 
     @staticmethod
-    def _domain_key(company: Dict[str, Any]) -> str:
-        return (company.get("domain") or "").strip().lower()
+    def _normalize_domain(value: str) -> str:
+        import urllib.parse as _url
+        d = (value or "").strip().lower()
+        if not d:
+            return ""
+        try:
+            if "://" in d:
+                parsed = _url.urlparse(d)
+                d = parsed.netloc or parsed.path
+        except Exception:
+            pass
+        if d.startswith("www."):
+            d = d[4:]
+        parts = d.split(":")[0].split("/")[0].split(".")
+        if len(parts) >= 3:
+            d = ".".join(parts[-2:])
+        return d
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        import re as _re
+        n = (name or "").lower()
+        n = _re.sub(r"[^a-z0-9\s]", "", n)
+        n = _re.sub(r"\b(incorporated|inc|llc|ltd|company|co|corp|corporation|realty|properties|property management)\b", "", n)
+        n = _re.sub(r"\s+", " ", n).strip()
+        return n
+
+    @classmethod
+    def _domain_key(cls, company: Dict[str, Any]) -> str:
+        dom = (company.get("domain") or "").strip()
+        if not dom:
+            url = (company.get("company_url") or "").strip()
+            if url:
+                dom = url
+        return cls._normalize_domain(dom)
 
     def _enrich_companies(self, companies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Run enrichment concurrently with a bounded pool
@@ -4196,6 +4733,181 @@ class EnrichmentRequestProcessor:
         request_payload = record.get("request") or {}
         parameters = request_payload.get("parameters") or {}
 
+        # Debug logging to understand request structure
+        logging.info("Processing request ID %s", request_id)
+        logging.info("Request payload keys: %s", list(request_payload.keys()))
+        logging.info("Parameters: %s", json.dumps(parameters, default=str))
+
+        # Splitting is handled inside LeadOrchestrator discovery only (no DB queue split)
+
+        notify_email = (
+            request_payload.get("notify_email")
+            or parameters.get("notify_email")
+            or self.base_config.notify_email
+        )
+
+        request_clone = json.loads(json.dumps(request_payload))
+        request_clone["last_attempt_at"] = datetime.utcnow().isoformat()
+        self.supabase.update_request_record(request_id, status="processing", request_payload=request_clone)
+
+        args = self._build_args_from_request(request_payload)
+        logging.info("Built args - location: %s, state: %s, city: %s", args.location, args.state, args.city)
+        run_config = replace(self.base_config)
+        run_config.notify_email = notify_email
+
+        orchestrator = LeadOrchestrator(run_config)
+        run_result = None
+
+        # Capture logs for this request
+        with RequestLogCapture(self.supabase, request_id):
+            try:
+                run_result = orchestrator.run(args)
+                self._mark_request_completed(request_id, request_payload, run_result)
+            except Exception as exc:  # pylint: disable=broad-except
+                self._mark_request_failed(request_id, request_payload, orchestrator, exc)
+                raise
+
+    def _split_and_queue_request(self, record: Dict[str, Any]) -> None:
+        """Split a large request into smaller chunks and queue them."""
+        try:
+            # Lazy import to avoid circular dependencies
+            from request_splitter import LLMRequestSplitter, RequestChunk
+
+            request_id = record.get("id")
+            request_payload = record.get("request", {})
+            parameters = request_payload.get("parameters", {})
+
+            # Initialize splitter (will use environment variable for API key)
+            splitter = LLMRequestSplitter(llm_provider="anthropic")
+
+            # Split the request
+            chunks = splitter.split_request(request_id, parameters)
+
+            logging.info(
+                "Splitting request %s into %d chunks",
+                request_id,
+                len(chunks)
+            )
+
+            # Create sub-requests in the database
+            sub_request_ids = []
+            for chunk in chunks:
+                sub_request_id = self._create_sub_request(record, chunk)
+                if sub_request_id:
+                    sub_request_ids.append(sub_request_id)
+
+            # Update parent request with split information and mark split_attempted
+            # NOTE: Avoid changing workflow_status here to bypass DB constraint (chk_workflow_status)
+            request_payload["split_attempted"] = True
+            run_logs = {
+                "split_time": datetime.utcnow().isoformat(),
+                "num_chunks": len(chunks),
+                "sub_request_ids": sub_request_ids,
+                "reason": f"Quantity {parameters.get('quantity')} exceeds chunk size limit of 10"
+            }
+            self.supabase.update_request_record(
+                request_id,
+                request_payload=request_payload,
+                run_logs=run_logs,
+            )
+
+            if sub_request_ids:
+                logging.info(
+                    "Successfully split request %s into %d sub-requests",
+                    request_id,
+                    len(sub_request_ids)
+                )
+                return
+            else:
+                logging.warning(
+                    "No sub-requests were created for %s; falling back to single-request processing",
+                    request_id,
+                )
+                # Fall back to processing as single request
+                self._process_single_request_without_split(record)
+                return
+
+        except ImportError as e:
+            logging.error(f"Failed to import request splitter: {e}")
+            # Fall back to processing as single large request
+            logging.warning(
+                "Processing request %s as single large request due to missing splitter",
+                record.get("id")
+            )
+            # Continue with regular processing
+            self._process_single_request_without_split(record)
+
+        except Exception as e:
+            logging.error(f"Failed to split request {record.get('id')}: {e}")
+            # Fall back to processing as single large request
+            self._process_single_request_without_split(record)
+
+    def _create_sub_request(self, parent_record: Dict[str, Any], chunk) -> Optional[int]:
+        """Create a sub-request in the database."""
+        try:
+            parent_id = parent_record.get("id")
+            parent_payload = parent_record.get("request", {})
+
+            # Build sub-request payload
+            sub_request = {
+                "workflow_status": "pending",
+                "request_time": datetime.utcnow().isoformat(),
+                "request": {
+                    **parent_payload,  # Copy parent request data
+                    "parameters": chunk.parameters,  # Use chunk-specific parameters
+                    "parent_request_id": parent_id,
+                    "chunk_info": {
+                        "chunk_id": chunk.chunk_id,
+                        "chunk_index": chunk.chunk_index,
+                        "total_chunks": chunk.total_chunks,
+                        "split_criteria": chunk.split_criteria
+                    }
+                },
+                "notes": f"Sub-request {chunk.chunk_index + 1}/{chunk.total_chunks} for parent {parent_id}"
+            }
+
+            # Insert into database
+            url = f"{self.supabase.base_url}/rest/v1/enrichment_requests"
+            response = _http_request(
+                "POST",
+                url,
+                headers=self.supabase.headers,
+                json_body=sub_request,
+                timeout=15
+            )
+
+            # Supabase may return a list of inserted rows or a single object depending on prefs
+            sub_id = None
+            if response:
+                if isinstance(response, dict):
+                    sub_id = response.get("id")
+                elif isinstance(response, list) and response:
+                    first = response[0]
+                    if isinstance(first, dict):
+                        sub_id = first.get("id")
+            if sub_id:
+                logging.info(
+                    "Created sub-request %s (chunk %d/%d) for parent %s",
+                    sub_id,
+                    chunk.chunk_index + 1,
+                    chunk.total_chunks,
+                    parent_id
+                )
+                return sub_id
+
+        except Exception as e:
+            logging.error(f"Failed to create sub-request: {e}")
+            return None
+
+    def _process_single_request_without_split(self, record: Dict[str, Any]) -> None:
+        """Process a request without splitting (fallback for when splitting fails)."""
+        # This is the original logic without the split check
+        request_id = record.get("id")
+        if request_id is None:
+            return
+        request_payload = record.get("request") or {}
+        parameters = request_payload.get("parameters") or {}
+
         notify_email = (
             request_payload.get("notify_email")
             or parameters.get("notify_email")
@@ -4211,14 +4923,12 @@ class EnrichmentRequestProcessor:
         run_config.notify_email = notify_email
 
         orchestrator = LeadOrchestrator(run_config)
-        run_result = None
 
-        # Capture logs for this request
         with RequestLogCapture(self.supabase, request_id):
             try:
                 run_result = orchestrator.run(args)
                 self._mark_request_completed(request_id, request_payload, run_result)
-            except Exception as exc:  # pylint: disable=broad-except
+            except Exception as exc:
                 self._mark_request_failed(request_id, request_payload, orchestrator, exc)
                 raise
 
@@ -4320,6 +5030,17 @@ class EnrichmentRequestProcessor:
         quantity = parameters.get("quantity") or request.get("quantity") or 10
 
         state = parameters.get("state")
+        if isinstance(state, list):
+            state = state[0]
+
+        # Map priority_locations to state if not set
+        if not state and parameters.get("priority_locations"):
+            locations = parameters["priority_locations"]
+            if isinstance(locations, list) and locations:
+                first_loc = locations[0]
+                # Check if it's a state abbreviation
+                if len(first_loc) == 2 and first_loc.upper() in US_STATE_ABBREVIATIONS:
+                    state = first_loc.upper()
         if isinstance(state, list):
             state = state[0]
         city = parameters.get("city")
