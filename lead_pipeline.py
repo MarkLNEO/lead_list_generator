@@ -3493,18 +3493,23 @@ class LeadOrchestrator:
             logging.info("=== Phase 2: Discovery rounds (need %d more) ===", max(0, buffer_quantity - len(companies)))
 
             # Prepare optional chunk plan for discovery-only splitting (no Supabase interaction)
+            # NOTE: Chunking is now handled by n8n workflow internally for better parallelization
+            # Set ENABLE_PYTHON_CHUNKING=true to re-enable Python-side chunking (not recommended)
             chunk_plan = []
             remaining_after_supabase = max(0, buffer_quantity - len(companies))
-            if args.quantity > 10 and remaining_after_supabase > 0:
-                try:
-                    from request_splitter import LLMRequestSplitter  # type: ignore
-                    splitter = LLMRequestSplitter(llm_provider="openai")
-                    base_params = {"quantity": args.quantity}
-                    chunk_plan = splitter.split_request(0, base_params) or []
-                    if chunk_plan:
-                        logging.info("Using discovery-only chunk plan with %d chunks", len(chunk_plan))
-                except Exception as exc:  # noqa: BLE001
-                    logging.debug("Discovery split unavailable: %s", exc)
+            if os.getenv("ENABLE_PYTHON_CHUNKING", "false").lower() == "true":
+                if args.quantity > 10 and remaining_after_supabase > 0:
+                    try:
+                        from request_splitter import LLMRequestSplitter  # type: ignore
+                        splitter = LLMRequestSplitter(llm_provider="openai")
+                        base_params = {"quantity": args.quantity}
+                        chunk_plan = splitter.split_request(0, base_params) or []
+                        if chunk_plan:
+                            logging.info("Using Python-side chunk plan with %d chunks", len(chunk_plan))
+                    except Exception as exc:  # noqa: BLE001
+                        logging.debug("Discovery split unavailable: %s", exc)
+            else:
+                logging.info("Python-side chunking disabled - n8n handles parallelization internally")
 
             attempt = 0
             # Adaptive parallel limit starting point
