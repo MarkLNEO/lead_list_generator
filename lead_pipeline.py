@@ -5394,72 +5394,33 @@ class EnrichmentRequestProcessor:
         unit_min: Optional[int],
     ) -> str:
         """
-        Build actionable discovery requirements, removing contradictory language
-        and adding context-aware guidance.
+        Build clean, concise discovery requirements without duplication.
         """
-        # Start with clean base requirements
+        # Build single concise sentence with all constraints
         parts = []
 
+        parts.append("Find property management companies")
+
         if location:
-            parts.append(f"Find property management companies in {location}.")
+            parts.append(f"in {location}")
 
+        constraints = []
         if pms:
-            parts.append(f"Must use {pms} as their property management system.")
-
+            constraints.append(f"using {pms}")
         if unit_min:
-            parts.append(f"Must manage at least {unit_min} units.")
+            constraints.append(f"managing {unit_min}+ units")
 
-        # Add original request context if useful (filter out contradictions)
-        if original_req:
-            # Remove common contradictory phrases
-            cleaned = original_req
-            contradictions = [
-                "Only an email address was provided",
-                "no targeting",
-                "no quantity",
-                "no locations",
-                "no PMS",
-                "no units",
-                "no campaign type",
-                "no timeframe specified",
-            ]
-            for phrase in contradictions:
-                if phrase.lower() in cleaned.lower():
-                    # Split on "/" and take only the useful part
-                    if "/" in cleaned:
-                        parts_split = cleaned.split("/")
-                        cleaned = parts_split[0].strip()
-                    break
+        if constraints:
+            parts.append("that are " + " and ".join(constraints))
 
-            # If there's still useful context, add it
-            if cleaned and cleaned not in " ".join(parts):
-                parts.append(cleaned.strip())
+        # Single clean sentence
+        base_req = " ".join(parts) + "."
 
-        # Add discovery guidance based on PMS
-        if pms:
-            pms_lower = pms.lower()
-            if "buildium" in pms_lower:
-                parts.append(
-                    "CRITICAL: Buildium does not publish customer directories. Use these specific discovery strategies: "
-                    "1) Search NARPM member directories and filter for companies mentioning 'Buildium' or 'ManageBuilding', "
-                    "2) Search LinkedIn for job postings with 'Buildium property manager' or 'ManageBuilding experience', "
-                    "3) Search for ManageBuilding.com tenant portals (format: *.managebuilding.com/listings), "
-                    "4) Use local PM directories and then verify PMS with analyzer tool. "
-                    "DO NOT use generic searches that will return non-Buildium companies."
-                )
-            elif "appfolio" in pms_lower:
-                parts.append(
-                    "Note: AppFolio customers often have .appfolio.com portals. "
-                    "Search for: 1) *.appfolio.com tenant portals, "
-                    "2) Corporate websites mentioning AppFolio, "
-                    "3) Run PMS analyzer on candidate domains."
-                )
-            elif "propertyware" in pms_lower:
-                parts.append(
-                    "Note: Propertyware customers may be listed on their partner page or in industry directories."
-                )
+        # Only add brief PMS-specific hint if needed
+        if pms and "buildium" in pms.lower():
+            base_req += " Note: Buildium has no public customer directory - check NARPM lists and *.managebuilding.com portals."
 
-        return " ".join(parts)
+        return base_req
 
     @staticmethod
     def _build_args_from_request(request: Dict[str, Any]) -> argparse.Namespace:
