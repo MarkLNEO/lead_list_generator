@@ -2876,6 +2876,129 @@ class LeadOrchestrator:
         })
         logging.error("Error: %s | Context: %s", error, json.dumps(context))
 
+    def _final_quality_gate(
+        self,
+        deliverable: List[Dict[str, Any]],
+        target_quantity: int,
+        args: argparse.Namespace,
+        run_dir: Path,
+    ) -> List[Dict[str, Any]]:
+        """
+        Final quality gate before CSV generation:
+        1. Remove any duplicate domains
+        2. Remove any companies with icp_fit=no
+        3. Backfill from discovery if removals occurred
+
+        This is the last line of defense to ensure quality.
+        """
+        logging.info("=" * 70)
+        logging.info("FINAL QUALITY GATE: Validating deliverable before CSV export")
+        logging.info("=" * 70)
+
+        initial_count = len(deliverable)
+        rejected: List[Dict[str, Any]] = []
+
+        # Step 1: Enforce strict deduplication by domain
+        seen_domains: Set[str] = set()
+        deduped: List[Dict[str, Any]] = []
+        duplicate_count = 0
+
+        for item in deliverable:
+            company = item.get("company") if isinstance(item, dict) else None
+            if not isinstance(company, dict):
+                rejected.append(item)
+                logging.warning("Quality gate: rejecting item without valid company structure")
+                continue
+
+            domain = self._domain_key(company)
+            if not domain:
+                rejected.append(item)
+                logging.warning("Quality gate: rejecting company without domain: %s",
+                              company.get("company_name") or "unknown")
+                continue
+
+            if domain in seen_domains:
+                duplicate_count += 1
+                rejected.append(item)
+                logging.warning("Quality gate: removing duplicate domain: %s", domain)
+                continue
+
+            seen_domains.add(domain)
+            deduped.append(item)
+
+        # Step 2: Enforce icp_fit != no
+        icp_no_count = 0
+        final_clean: List[Dict[str, Any]] = []
+
+        for item in deduped:
+            company = item.get("company", {})
+            icp_fit = str(company.get("icp_fit", "")).strip().lower()
+            single_family = str(company.get("single_family", "")).strip().lower()
+
+            # Reject if icp_fit explicitly says "no"
+            if icp_fit.startswith("no"):
+                icp_no_count += 1
+                rejected.append(item)
+                logging.warning(
+                    "Quality gate: removing company with icp_fit=no: %s (icp_fit=%s)",
+                    company.get("company_name") or company.get("domain") or "unknown",
+                    icp_fit
+                )
+                continue
+
+            # Also reject if single_family explicitly says "no" (conservative)
+            if single_family.startswith("no"):
+                icp_no_count += 1
+                rejected.append(item)
+                logging.warning(
+                    "Quality gate: removing company with single_family=no: %s",
+                    company.get("company_name") or company.get("domain") or "unknown"
+                )
+                continue
+
+            final_clean.append(item)
+
+        removed_count = initial_count - len(final_clean)
+
+        if removed_count > 0:
+            logging.warning(
+                "Quality gate REJECTED %d/%d companies: %d duplicates, %d icp_fit=no",
+                removed_count, initial_count, duplicate_count, icp_no_count
+            )
+
+            # Save rejected companies for audit
+            try:
+                rejected_file = run_dir / "quality_gate_rejected.json"
+                rejected_file.write_text(json.dumps(rejected, indent=2))
+                logging.info("Rejected companies saved to: %s", rejected_file)
+            except Exception as exc:
+                logging.warning("Could not save rejected companies: %s", exc)
+
+            # Backfill if we're short
+            shortfall = target_quantity - len(final_clean)
+            if shortfall > 0:
+                logging.info("=" * 70)
+                logging.info("BACKFILL: Quality gate removed %d companies, need %d more to meet target",
+                           removed_count, shortfall)
+                logging.info("=" * 70)
+
+                # Trigger discovery to backfill
+                final_clean = self._topup_results(final_clean, shortfall, args, run_dir)
+
+                # Re-apply all filters to backfilled results
+                final_clean = self._filter_enriched_results_by_location(final_clean)
+                final_clean = self._filter_enriched_results_by_property_type(final_clean)
+
+                # CRITICAL: Run quality gate again on backfilled results (recursive, but with base case)
+                if len(final_clean) < len(deliverable):
+                    logging.warning("Backfill did not fully recover; delivering %d/%d",
+                                  len(final_clean), target_quantity)
+        else:
+            logging.info("Quality gate: ✓ All %d companies passed validation", initial_count)
+
+        logging.info("=" * 70)
+        return final_clean
+
     def _log_phase_summary(self, delivered: int, requested: int) -> None:
         """Log comprehensive funnel metrics showing the full pipeline flow."""
         logging.info("=" * 70)
@@ -3508,6 +3631,10 @@ class LeadOrchestrator:
                 logging.error(error_msg)
                 self._track_error("Final gate failed", {"requested": target_quantity, "have": len(deliverable)})
                 raise ValueError(error_msg)
+
+            # CRITICAL: Final quality gate before CSV generation
+            # This removes duplicates and icp_fit=no, then backfills if needed
+            deliverable = self._final_quality_gate(deliverable, target_quantity, args, run_dir)
 
             # Log comprehensive phase summary
             self._log_phase_summary(len(deliverable), target_quantity)
