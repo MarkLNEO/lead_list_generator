@@ -2926,8 +2926,11 @@ class LeadOrchestrator:
             seen_domains.add(domain)
             deduped.append(item)
 
-        # Step 2: Enforce icp_fit != no
+        # Step 2: Enforce icp_fit != no and validate user requirements
         icp_no_count = 0
+        pms_mismatch_count = 0
+        unit_below_min_count = 0
+        unit_above_max_count = 0
         final_clean: List[Dict[str, Any]] = []
 
         for item in deduped:
@@ -2956,14 +2959,73 @@ class LeadOrchestrator:
                 )
                 continue
 
+            # Step 3: Validate PMS requirement if specified
+            if args.pms:
+                required_pms = args.pms.lower().strip()
+                company_pms = str(company.get("pms", "")).lower().strip()
+
+                # Check for match (handle variations like "Buildium (ManageBuilding)")
+                # Consider it a match if the required PMS appears anywhere in the company PMS field
+                pms_matches = (
+                    required_pms in company_pms or
+                    company_pms.startswith(required_pms) or
+                    (required_pms == "buildium" and ("managebuilding" in company_pms or "manage building" in company_pms))
+                )
+
+                if not pms_matches:
+                    pms_mismatch_count += 1
+                    rejected.append(item)
+                    logging.warning(
+                        "Quality gate: removing company with wrong PMS: %s (required=%s, found=%s)",
+                        company.get("company_name") or company.get("domain") or "unknown",
+                        args.pms,
+                        company.get("pms") or "Unknown"
+                    )
+                    continue
+
+            # Step 4: Validate unit count requirements
+            unit_count_raw = company.get("unit_count") or company.get("units_managed") or company.get("doors") or 0
+            try:
+                unit_count = int(unit_count_raw)
+            except (ValueError, TypeError):
+                # Try to extract number from string like "300 units" or "~120"
+                unit_str = str(unit_count_raw).replace(",", "").replace("~", "").strip()
+                try:
+                    unit_count = int("".join(filter(str.isdigit, unit_str)) or "0")
+                except (ValueError, TypeError):
+                    unit_count = 0
+
+            if args.unit_min and unit_count > 0 and unit_count < args.unit_min:
+                unit_below_min_count += 1
+                rejected.append(item)
+                logging.warning(
+                    "Quality gate: removing company below minimum units: %s (required>=%d, found=%d)",
+                    company.get("company_name") or company.get("domain") or "unknown",
+                    args.unit_min,
+                    unit_count
+                )
+                continue
+
+            if args.unit_max and unit_count > args.unit_max:
+                unit_above_max_count += 1
+                rejected.append(item)
+                logging.warning(
+                    "Quality gate: removing company above maximum units: %s (required<=%d, found=%d)",
+                    company.get("company_name") or company.get("domain") or "unknown",
+                    args.unit_max,
+                    unit_count
+                )
+                continue
+
             final_clean.append(item)
 
         removed_count = initial_count - len(final_clean)
 
         if removed_count > 0:
             logging.warning(
-                "Quality gate REJECTED %d/%d companies: %d duplicates, %d icp_fit=no",
-                removed_count, initial_count, duplicate_count, icp_no_count
+                "Quality gate REJECTED %d/%d companies: %d duplicates, %d icp_fit=no, %d wrong PMS, %d below min units, %d above max units",
+                removed_count, initial_count, duplicate_count, icp_no_count, pms_mismatch_count,
+                unit_below_min_count, unit_above_max_count
             )
 
             # Save rejected companies for audit
@@ -3820,6 +3882,67 @@ class LeadOrchestrator:
                 dom = url
         return cls._normalize_domain(dom)
 
+    def _meets_requirements(self, company: Dict[str, Any], args: argparse.Namespace) -> bool:
+        """
+        Check if enriched company meets user requirements (PMS, unit count).
+        Returns True if all requirements are met, False otherwise.
+
+        This is used for early rejection during enrichment to save API calls.
+        """
+        # Validate PMS requirement if specified
+        if args.pms:
+            required_pms = args.pms.lower().strip()
+            company_pms = str(company.get("pms", "")).lower().strip()
+
+            # Check for match (handle variations like "Buildium (ManageBuilding)")
+            pms_matches = (
+                required_pms in company_pms or
+                company_pms.startswith(required_pms) or
+                (required_pms == "buildium" and ("managebuilding" in company_pms or "manage building" in company_pms))
+            )
+
+            if not pms_matches:
+                logging.debug(
+                    "Company %s does not match PMS requirement (required=%s, found=%s)",
+                    company.get("company_name"),
+                    args.pms,
+                    company.get("pms") or "Unknown"
+                )
+                return False
+
+        # Validate unit count requirements
+        if args.unit_min or args.unit_max:
+            unit_count_raw = company.get("unit_count") or company.get("units_managed") or company.get("doors") or 0
+            try:
+                unit_count = int(unit_count_raw)
+            except (ValueError, TypeError):
+                # Try to extract number from string like "300 units" or "~120"
+                unit_str = str(unit_count_raw).replace(",", "").replace("~", "").strip()
+                try:
+                    unit_count = int("".join(filter(str.isdigit, unit_str)) or "0")
+                except (ValueError, TypeError):
+                    unit_count = 0
+
+            if args.unit_min and unit_count > 0 and unit_count < args.unit_min:
+                logging.debug(
+                    "Company %s below minimum units (required>=%d, found=%d)",
+                    company.get("company_name"),
+                    args.unit_min,
+                    unit_count
+                )
+                return False
+
+            if args.unit_max and unit_count > args.unit_max:
+                logging.debug(
+                    "Company %s above maximum units (required<=%d, found=%d)",
+                    company.get("company_name"),
+                    args.unit_max,
+                    unit_count
+                )
+                return False
+
+        return True
+
     def _enrich_companies(self, companies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Run enrichment concurrently with a bounded pool
         max_workers = max(1, self.config.enrichment_concurrency)
@@ -4117,7 +4240,18 @@ class LeadOrchestrator:
                     if source_value not in (None, "", []):
                         enriched_company[target_field] = source_value
                         break
-        
+
+        # Validate against original requirements BEFORE discovering contacts (saves API calls)
+        if not self._meets_requirements(enriched_company, self.args):
+            logging.info(
+                "Company %s does not meet requirements (pms=%s, units=%s), rejecting early",
+                company.get("company_name"),
+                enriched_company.get("pms") or "Unknown",
+                enriched_company.get("unit_count") or enriched_company.get("units_managed") or "Unknown"
+            )
+            self.metrics["companies_rejected"] += 1
+            return None
+
         # Process contacts with deduplication
         verified_contacts = self._discover_and_verify_contacts(enriched_company, company)
 
@@ -5306,14 +5440,19 @@ class EnrichmentRequestProcessor:
             pms_lower = pms.lower()
             if "buildium" in pms_lower:
                 parts.append(
-                    "Note: Buildium does not publish customer directories. "
-                    "Try alternative discovery: NARPM member lists, LinkedIn job postings mentioning Buildium, "
-                    "or run PMS analyzer on local property management company domains."
+                    "CRITICAL: Buildium does not publish customer directories. Use these specific discovery strategies: "
+                    "1) Search NARPM member directories and filter for companies mentioning 'Buildium' or 'ManageBuilding', "
+                    "2) Search LinkedIn for job postings with 'Buildium property manager' or 'ManageBuilding experience', "
+                    "3) Search for ManageBuilding.com tenant portals (format: *.managebuilding.com/listings), "
+                    "4) Use local PM directories and then verify PMS with analyzer tool. "
+                    "DO NOT use generic searches that will return non-Buildium companies."
                 )
             elif "appfolio" in pms_lower:
                 parts.append(
                     "Note: AppFolio customers often have .appfolio.com portals. "
-                    "Check for corporate website mentions of AppFolio or run PMS analyzer."
+                    "Search for: 1) *.appfolio.com tenant portals, "
+                    "2) Corporate websites mentioning AppFolio, "
+                    "3) Run PMS analyzer on candidate domains."
                 )
             elif "propertyware" in pms_lower:
                 parts.append(
