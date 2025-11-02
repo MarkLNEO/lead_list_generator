@@ -3288,6 +3288,9 @@ class LeadOrchestrator:
 
     def run(self, args: argparse.Namespace) -> Dict[str, Any]:
         """Execute pipeline with production resilience and recovery."""
+        # Store args for requirement validation during enrichment
+        self.args = args
+
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         self.last_run_id = run_id
         run_dir = Path.cwd() / "runs" / run_id
