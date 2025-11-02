@@ -2831,13 +2831,18 @@ class LeadOrchestrator:
 
         return False
 
-    def _calculate_buffer_target(self, requested: int) -> Tuple[int, float]:
+    def _calculate_buffer_target(self, requested: int, args: Optional[argparse.Namespace] = None) -> Tuple[int, float]:
         """
         Determine how many companies to queue up front based on requested quantity.
 
         Smaller requests need a larger multiplier (3-4x) while larger batches would
         explode if we kept that ratio. This sliding scale keeps enough headroom for
         attrition without overwhelming discovery.
+
+        Additionally adjusts buffer based on rejection risk:
+        - PMS requirement: increases rejection risk (specific PMS may be rare)
+        - Unit count requirement: increases rejection risk (specific ranges are narrow)
+        - Combined requirements: compounding risk needs even higher buffer
         """
         requested = max(1, requested)
         thresholds: List[Tuple[int, float]] = [
@@ -2853,6 +2858,27 @@ class LeadOrchestrator:
             if requested <= limit:
                 multiplier = candidate
                 break
+
+        # Adjust multiplier based on rejection risk from requirements
+        if args:
+            has_pms = bool(args.pms)
+            has_unit_req = bool(args.unit_min or args.unit_max)
+
+            if has_pms and has_unit_req:
+                # Both PMS and unit requirements = high rejection risk (50-70%)
+                # Need 2.5-3.0x buffer to compensate
+                multiplier = min(multiplier * 1.5, 3.5)
+                logging.info("Increased buffer multiplier to %.2fx (PMS + unit requirements = high rejection risk)", multiplier)
+            elif has_pms:
+                # PMS requirement alone = moderate-high rejection (40-60%)
+                # Need 2.0-2.5x buffer
+                multiplier = min(multiplier * 1.3, 3.0)
+                logging.info("Increased buffer multiplier to %.2fx (PMS requirement = moderate rejection risk)", multiplier)
+            elif has_unit_req:
+                # Unit requirement alone = moderate rejection (30-50%)
+                # Need 1.8-2.0x buffer
+                multiplier = min(multiplier * 1.2, 2.5)
+                logging.info("Increased buffer multiplier to %.2fx (unit requirement = moderate rejection risk)", multiplier)
 
         buffer_target = max(requested + 1, math.ceil(requested * multiplier))
         buffer_target = min(buffer_target, self.config.max_companies_per_run)
@@ -2882,17 +2908,22 @@ class LeadOrchestrator:
         target_quantity: int,
         args: argparse.Namespace,
         run_dir: Path,
+        recursion_depth: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Final quality gate before CSV generation:
         1. Remove any duplicate domains
         2. Remove any companies with icp_fit=no
-        3. Backfill from discovery if removals occurred
+        3. Validate PMS and unit count requirements
+        4. Backfill from discovery if removals occurred
+        5. Recursively validate backfilled results (max 2 levels)
 
         This is the last line of defense to ensure quality.
         """
+        max_recursion = 2
+        recursion_label = f" (backfill validation round {recursion_depth})" if recursion_depth > 0 else ""
         logging.info("=" * 70)
-        logging.info("FINAL QUALITY GATE: Validating deliverable before CSV export")
+        logging.info("FINAL QUALITY GATE%s: Validating deliverable before CSV export", recursion_label)
         logging.info("=" * 70)
 
         initial_count = len(deliverable)
@@ -3039,9 +3070,44 @@ class LeadOrchestrator:
             # Backfill if we're short
             shortfall = target_quantity - len(final_clean)
             if shortfall > 0:
+                # Calculate rejection rate to assess if requirements are too narrow
+                rejection_rate = removed_count / max(1, initial_count)
+
                 logging.info("=" * 70)
-                logging.info("BACKFILL: Quality gate removed %d companies, need %d more to meet target",
-                           removed_count, shortfall)
+                logging.info("BACKFILL: Quality gate removed %d companies (%.1f%% rejection), need %d more to meet target",
+                           removed_count, rejection_rate * 100, shortfall)
+
+                # Fail fast if rejection rate is extremely high and this is first pass (not a recursion)
+                if recursion_depth == 0 and rejection_rate > 0.80 and initial_count >= 10:
+                    logging.warning("=" * 70)
+                    logging.warning("HIGH REJECTION RATE: %.1f%% of companies failed quality gate!", rejection_rate * 100)
+                    logging.warning("Breakdown: %d duplicates, %d icp_fit=no, %d wrong PMS, %d wrong units",
+                                  duplicate_count, icp_no_count, pms_mismatch_count,
+                                  unit_below_min_count + unit_above_max_count)
+
+                    # PMS rejection is the most common issue - provide specific guidance
+                    if pms_mismatch_count > initial_count * 0.5:
+                        logging.warning("⚠️  CRITICAL: %d/%d companies (%.1f%%) have wrong PMS (required: %s)",
+                                      pms_mismatch_count, initial_count,
+                                      (pms_mismatch_count / max(1, initial_count)) * 100,
+                                      args.pms)
+                        logging.warning("This PMS may be rare in this market. Consider:")
+                        logging.warning("  1. Removing PMS requirement (find companies, then filter manually)")
+                        logging.warning("  2. Widening location (state-wide instead of city)")
+                        logging.warning("  3. Reducing unit count requirements")
+
+                    # Unit count rejection guidance
+                    elif (unit_below_min_count + unit_above_max_count) > initial_count * 0.5:
+                        logging.warning("⚠️  CRITICAL: %d/%d companies (%.1f%%) outside unit count range",
+                                      unit_below_min_count + unit_above_max_count, initial_count,
+                                      ((unit_below_min_count + unit_above_max_count) / max(1, initial_count)) * 100)
+                        logging.warning("This unit range may be too narrow for this market. Consider:")
+                        logging.warning("  1. Widening unit range (e.g., 50-200 instead of 99-150)")
+                        logging.warning("  2. Removing unit requirement entirely")
+
+                    logging.warning("Continuing with backfill, but expect low success rate.")
+                    logging.warning("=" * 70)
+
                 logging.info("=" * 70)
 
                 # Trigger discovery to backfill
@@ -3051,8 +3117,18 @@ class LeadOrchestrator:
                 final_clean = self._filter_enriched_results_by_location(final_clean)
                 final_clean = self._filter_enriched_results_by_property_type(final_clean)
 
-                # CRITICAL: Run quality gate again on backfilled results (recursive, but with base case)
-                if len(final_clean) < len(deliverable):
+                # CRITICAL: Recursively validate backfilled results to catch bad companies
+                # Limit recursion to prevent infinite loops
+                if recursion_depth < max_recursion and len(final_clean) > 0:
+                    logging.info("Re-validating backfilled results (recursion %d/%d)",
+                               recursion_depth + 1, max_recursion)
+                    final_clean = self._final_quality_gate(
+                        final_clean, target_quantity, args, run_dir, recursion_depth + 1
+                    )
+                elif recursion_depth >= max_recursion:
+                    logging.warning("Max quality gate recursion reached (%d); skipping re-validation", max_recursion)
+
+                if len(final_clean) < target_quantity:
                     logging.warning("Backfill did not fully recover; delivering %d/%d",
                                   len(final_clean), target_quantity)
         else:
@@ -3375,7 +3451,7 @@ class LeadOrchestrator:
                 target_quantity,
             )
         
-        buffer_quantity, buffer_multiplier = self._calculate_buffer_target(target_quantity)
+        buffer_quantity, buffer_multiplier = self._calculate_buffer_target(target_quantity, args)
         max_rounds = max(1, args.max_rounds or self.config.discovery_max_rounds)
 
         logging.info(
@@ -3669,12 +3745,32 @@ class LeadOrchestrator:
                 logging.warning("No companies found after enrichment phase")
 
             logging.info("Enriched companies: %d (target: %d)", len(deliverable), target_quantity)
-            
+
             # Phase 4: Top-up if needed
             missing = target_quantity - len(deliverable)
             if missing > 0:
                 logging.info("=== Phase 4: Top-up round (need %d more) ===", missing)
-                deliverable = self._topup_results(deliverable, missing, args, run_dir)
+
+                # Check if we should use PMS-first fallback flow BEFORE normal topup
+                shortfall_pct = missing / max(1, target_quantity)
+                if (args.pms and
+                    shortfall_pct > 0.30 and
+                    not getattr(self, '_pms_fallback_attempted', False)):
+                    logging.info("Shortfall %.1f%% > 30%% with PMS requirement - considering fallback flow",
+                               shortfall_pct * 100)
+
+                    # Try PMS-first fallback before normal topup
+                    fallback_results = self._pms_fallback_discovery(missing, args, run_dir,
+                                                                    self.all_attempted_domains)
+                    if fallback_results:
+                        deliverable.extend(fallback_results)
+                        missing = target_quantity - len(deliverable)
+                        logging.info("After PMS fallback: %d companies (still need %d)",
+                                   len(deliverable), max(0, missing))
+
+                # Continue with normal topup if still short
+                if missing > 0:
+                    deliverable = self._topup_results(deliverable, missing, args, run_dir)
                 deliverable = self._filter_enriched_results_by_location(deliverable)
                 deliverable = self._filter_enriched_results_by_property_type(deliverable)
 
@@ -4625,6 +4721,281 @@ class LeadOrchestrator:
 
         return updated
 
+    def _call_bulk_company_finder(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Call n8n bulk company finder workflow.
+
+        This webhook returns 100-200 property management companies based on location filters,
+        without PMS filtering (wide net for later PMS-based filtering).
+        """
+        import requests
+
+        webhook_url = os.getenv("N8n_FALLBACK_DISCOVERY_WEBHOOK")
+        if not webhook_url:
+            raise ValueError("N8n_FALLBACK_DISCOVERY_WEBHOOK not configured - cannot use PMS fallback flow")
+
+        timeout = int(os.getenv("BULK_FINDER_TIMEOUT", "300"))  # 5min default
+
+        logging.info("Calling bulk company finder webhook: %s", webhook_url)
+        logging.info("Request: %s", json.dumps(request, indent=2))
+
+        try:
+            response = requests.post(
+                webhook_url,
+                json=request,
+                timeout=timeout,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            logging.info("Bulk finder returned %d companies", len(result.get("companies", [])))
+
+            return result
+
+        except requests.Timeout:
+            logging.error("Bulk company finder timed out after %ds", timeout)
+            raise
+        except requests.RequestException as exc:
+            logging.error("Bulk company finder request failed: %s", exc)
+            raise
+
+    def _detect_pms_batch(
+        self,
+        companies: List[Dict[str, Any]],
+        required_pms: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Lightweight batch PMS detection for a list of companies.
+        Returns only companies with matching PMS.
+
+        This is much cheaper than full enrichment - only detects PMS field.
+        Cost: ~$0.10 per company vs $1.00 for full enrichment.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        concurrency = int(os.getenv("PMS_DETECTION_CONCURRENCY", "10"))
+        required_lower = required_pms.lower().strip()
+
+        def _quick_pms_check(company: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """Single lightweight PMS check."""
+            try:
+                domain = company.get("domain") or company.get("website", "")
+                if not domain:
+                    return None
+
+                # Use discovery hints if available (free!)
+                hints = company.get("discovery_hints", {})
+                tech_stack = hints.get("tech_stack_visible", [])
+                portal_subdomain = hints.get("portal_subdomain")
+
+                # Quick check from hints
+                for tech in tech_stack:
+                    if required_lower in tech.lower():
+                        company["pms"] = tech
+                        company["pms_confidence"] = "high"
+                        company["pms_source"] = "discovery_hints"
+                        logging.debug("PMS match from hints: %s → %s", domain, tech)
+                        return company
+
+                # Check portal subdomain patterns
+                if portal_subdomain:
+                    pms_patterns = {
+                        "appfolio": ["appfolio.com", "tenant.appfolio"],
+                        "buildium": ["managebuilding.com", "residentportal"],
+                        "yardi": ["yardi.com", "rentcafe"],
+                        "propertyware": ["propertyware.com"],
+                    }
+                    for pms_name, patterns in pms_patterns.items():
+                        if required_lower == pms_name and any(p in portal_subdomain.lower() for p in patterns):
+                            company["pms"] = pms_name.title()
+                            company["pms_confidence"] = "high"
+                            company["pms_source"] = "portal_subdomain"
+                            logging.debug("PMS match from portal: %s → %s", domain, pms_name)
+                            return company
+
+                # TODO: Fall back to lightweight enrichment API for PMS detection
+                # For now, we rely on hints only (free!).
+                # In future, we can add a lightweight PMS-only enrichment call here
+                # that costs ~$0.10 vs $1.00 for full enrichment.
+
+                # If no hints matched, this company doesn't have obvious PMS markers
+                return None
+
+            except Exception as exc:
+                logging.debug("PMS check failed for %s: %s",
+                            company.get("domain"), exc)
+                return None
+
+        logging.info("Starting batch PMS detection for %d companies (concurrency: %d)",
+                   len(companies), concurrency)
+
+        matches = []
+        checked = 0
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(_quick_pms_check, comp): comp
+                for comp in companies
+            }
+
+            for future in as_completed(futures):
+                checked += 1
+                if checked % 20 == 0:
+                    logging.info("PMS detection progress: %d/%d checked, %d matched",
+                               checked, len(companies), len(matches))
+
+                result = future.result()
+                if result:
+                    matches.append(result)
+
+        match_rate = (len(matches) / len(companies)) * 100 if companies else 0
+        logging.info("PMS batch detection complete: %d/%d companies match %s (%.1f%% match rate)",
+                   len(matches), len(companies), required_pms, match_rate)
+
+        return matches
+
+    def _pms_fallback_discovery(
+        self,
+        needed: int,
+        args: argparse.Namespace,
+        run_dir: Path,
+        suppression_domains: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Alternative discovery flow for rare PMS scenarios (e.g., Buildium).
+
+        Flow:
+        1. Wide discovery (location + units only, NO PMS requirement) → 100-200 companies
+        2. Lightweight PMS batch detection → filter to matching PMS
+        3. Full enrichment on filtered set → contacts + full data
+
+        This is 2-3x cheaper than normal flow when PMS is rare:
+        - Normal: 75 companies × $1 enrichment = $75, get 5 matches (93% waste)
+        - Fallback: 150 companies × $0.10 PMS detect = $15, then 10 matches × $1 = $10 → $25 total
+        """
+        self._pms_fallback_attempted = True
+
+        logging.info("=" * 70)
+        logging.info("🔄 PMS-FIRST FALLBACK FLOW ACTIVATED")
+        logging.info("Target: %d companies with PMS=%s", needed, args.pms)
+        logging.info("Strategy: Wide discovery → PMS filter → Targeted enrichment")
+        logging.info("=" * 70)
+
+        try:
+            # Step 1: Call bulk company finder agent (your n8n workflow)
+            wide_quantity = max(100, needed * 4)  # 4x multiplier for PMS filtering
+
+            logging.info("Step 1: Bulk company finder (target: %d companies, no PMS filter)",
+                       wide_quantity)
+
+            # Build request for bulk finder agent
+            finder_request = {
+                "filters": {
+                    "city": args.city or None,
+                    "state": args.state,
+                    "region": args.location if not args.city else None,
+                    "country": "US",
+                    "radius_miles": int(os.getenv("BULK_FINDER_RADIUS", "50")),
+                    "unit_count_min": args.unit_min,
+                    "unit_count_max": args.unit_max,
+                },
+                "suppression_list": list(suppression_domains),
+                "target_count": wide_quantity,
+                "tool_budget": int(os.getenv("BULK_FINDER_TOOL_BUDGET", "30")),
+                "context": {
+                    "now_utc": datetime.now(timezone.utc).isoformat(),
+                    "as_of_month_year": datetime.now().strftime("%B %Y"),
+                }
+            }
+
+            # Call your n8n bulk finder workflow
+            bulk_response = self._call_bulk_company_finder(finder_request)
+
+            discovered = bulk_response.get("companies", [])
+            search_strategies = bulk_response.get("search_strategies_used", [])
+            expansion = bulk_response.get("expansion_applied", {})
+
+            logging.info("Step 1 complete: %d companies discovered", len(discovered))
+            if search_strategies:
+                logging.info("  Strategies used: %s", ", ".join(search_strategies[:3]))
+            if expansion:
+                logging.info("  Auto-expansion: %s → %s (final: %d)",
+                           expansion.get("initial_radius_miles"),
+                           expansion.get("expanded_to"),
+                           expansion.get("final_count"))
+
+            if not discovered:
+                logging.warning("Bulk finder returned no companies - PMS fallback aborted")
+                return []
+
+            # Convert to internal format
+            companies = []
+            for comp in discovered:
+                companies.append({
+                    "company_name": comp.get("name"),
+                    "domain": comp.get("domain"),
+                    "city": comp.get("city"),
+                    "state": comp.get("state"),
+                    "website": comp.get("source"),
+                    # Preserve discovery hints for PMS detection
+                    "discovery_hints": comp.get("discovery_hints", {}),
+                })
+
+            # Step 2: Batch PMS detection (lightweight)
+            logging.info("Step 2: Batch PMS detection for %d companies", len(companies))
+            pms_matches = self._detect_pms_batch(companies, args.pms)
+
+            if not pms_matches:
+                logging.warning("No companies matched PMS=%s after batch detection", args.pms)
+                logging.warning("Consider widening search or removing PMS requirement")
+                return []
+
+            match_rate = (len(pms_matches) / len(companies)) * 100
+            logging.info("Step 2 complete: %d/%d companies match PMS=%s (%.1f%% match rate)",
+                       len(pms_matches), len(companies), args.pms, match_rate)
+
+            # Step 3: Full enrichment on PMS-filtered subset
+            candidates = pms_matches[:needed * 2]  # 2x buffer for quality gate
+            logging.info("Step 3: Full enrichment for %d PMS-matched companies", len(candidates))
+
+            enriched = self._enrich_companies_resilient(candidates, run_dir)
+
+            # Apply post-enrichment filters
+            enriched = self._filter_enriched_results_by_location(enriched)
+            enriched = self._filter_enriched_results_by_property_type(enriched)
+
+            # Cost estimate
+            pms_detect_cost = len(companies) * 0.10
+            enrich_cost = len(candidates) * 1.00
+            total_cost = 10 + pms_detect_cost + enrich_cost  # ~$10 for bulk finder
+
+            logging.info("Step 3 complete: %d companies fully enriched", len(enriched))
+            logging.info("=" * 70)
+            logging.info("✅ PMS-FIRST FALLBACK COMPLETE: %d companies ready", len(enriched))
+            logging.info("Cost estimate: Bulk finder ~$10 + PMS detect ~$%.0f + Enrich ~$%.0f = ~$%.0f total",
+                       pms_detect_cost, enrich_cost, total_cost)
+            logging.info("  (vs normal flow: ~$%.0f for same enrichment count)",
+                       (len(companies) * 1.00))
+            logging.info("=" * 70)
+
+            # Track metrics
+            self.metrics["pms_fallback_used"] = True
+            self.metrics["pms_fallback_discovered"] = len(discovered)
+            self.metrics["pms_fallback_pms_checked"] = len(companies)
+            self.metrics["pms_fallback_matched"] = len(pms_matches)
+            self.metrics["pms_fallback_match_rate"] = match_rate
+            self.metrics["pms_fallback_enriched"] = len(enriched)
+            self.metrics["pms_fallback_strategies"] = search_strategies
+            self.metrics["pms_fallback_cost_estimate"] = total_cost
+
+            return enriched
+
+        except Exception as exc:
+            logging.error("PMS fallback flow failed: %s", exc, exc_info=True)
+            self.metrics["pms_fallback_error"] = str(exc)
+            return []
+
     def _topup_results(
         self,
         current_results: List[Dict[str, Any]],
@@ -4645,7 +5016,7 @@ class LeadOrchestrator:
 
         extra_rounds = 0
         max_extra = max(2, int(os.getenv("TOPUP_MAX_ROUNDS", "3")))
-        
+
         while missing > 0 and extra_rounds < max_extra:
             extra_rounds += 1
             logging.info("Top-up round %d: need %d more companies", extra_rounds, missing)
@@ -4725,7 +5096,25 @@ class LeadOrchestrator:
             except Exception as exc:
                 logging.error("Top-up round %d failed: %s", extra_rounds, exc)
                 break
-        
+
+        # After exhausting normal topup rounds, try PMS-first fallback if applicable
+        missing = self.current_target_quantity - len(current_results)
+        shortfall_pct = missing / max(1, self.current_target_quantity)
+
+        if (missing > 0 and
+            args.pms and
+            shortfall_pct > 0.30 and
+            not getattr(self, '_pms_fallback_attempted', False)):
+
+            logging.info("=" * 70)
+            logging.info("TOPUP EXHAUSTED: After %d rounds, still short by %d (%.1f%%)",
+                       extra_rounds, missing, shortfall_pct * 100)
+            logging.info("Triggering PMS-first fallback flow as last resort")
+            logging.info("=" * 70)
+
+            fallback_results = self._pms_fallback_discovery(missing, args, run_dir, tried_domains)
+            current_results.extend(fallback_results)
+
         return current_results
 
     def _save_incremental_results(self, results: List[Dict[str, Any]], path: Path) -> None:

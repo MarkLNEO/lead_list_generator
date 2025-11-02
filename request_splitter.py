@@ -145,7 +145,9 @@ class LLMRequestSplitter:
         if not location_hint:
             return []
 
-        target_chunks = max(2, min(5, math.ceil(qty / self.chunk_size)))
+        # Don't cap chunks - allow scaling for large requests
+        # chunk_size is a soft target per chunk, not a hard limit on total allocation
+        target_chunks = max(2, min(20, math.ceil(qty / self.chunk_size)))
 
         # Serve from cache if available
         cache_key = f"{location_hint.lower().strip()}::size={self.chunk_size}::target={target_chunks}"
@@ -253,16 +255,16 @@ class LLMRequestSplitter:
         # Compute exact allocation so the sum of chunk quantities == qty
         total_chunks = len(neighborhoods)
         base = max(1, qty // max(1, total_chunks))
-        # Cap base to chunk_size
-        base = min(base, self.chunk_size)
-        # Distribute remainder to first chunks while respecting chunk_size
+        # Don't cap base - allow large allocations per chunk for 50-100 company requests
+        # chunk_size is a discovery guidance hint, not a hard limit on what we allocate
+        # Distribute remainder to first chunks
         remainder = max(0, qty - base * total_chunks)
 
         chunks: List[RequestChunk] = []
         for idx, area in enumerate(neighborhoods):
             params = dict(parameters)
-            add = 1 if remainder > 0 and base < self.chunk_size else 0
-            if remainder > 0 and base + add <= self.chunk_size:
+            add = 1 if remainder > 0 else 0
+            if remainder > 0:
                 remainder -= 1
             per_chunk_qty = base + add
             params["quantity"] = per_chunk_qty
@@ -292,10 +294,10 @@ class LLMRequestSplitter:
     def _geographic_or_alphabetical_split(
         self, request_id: int, parameters: Dict[str, Any], qty: int
     ) -> List[RequestChunk]:
-        # Decide number of chunks
+        # Decide number of chunks - allow scaling for large requests
         total_chunks = max(2, math.ceil(qty / self.chunk_size))
-        # Cap total chunks to avoid over-fragmentation
-        total_chunks = min(total_chunks, 5)
+        # Cap to 20 chunks to avoid over-fragmentation
+        total_chunks = min(total_chunks, 20)
 
         chunks: List[RequestChunk] = []
 
@@ -307,14 +309,13 @@ class LLMRequestSplitter:
             "East/Coastal",
             "West/Suburban",
         ]
-        # Exact allocation across chunks
+        # Exact allocation across chunks - don't cap base per chunk
         base = max(1, qty // total_chunks)
-        base = min(base, self.chunk_size)
         remainder = max(0, qty - base * total_chunks)
         for idx in range(total_chunks):
             area = broad_areas[idx % len(broad_areas)]
-            add = 1 if remainder > 0 and base < self.chunk_size else 0
-            if remainder > 0 and base + add <= self.chunk_size:
+            add = 1 if remainder > 0 else 0
+            if remainder > 0:
                 remainder -= 1
             per_chunk = base + add
             child_params = copy.deepcopy(parameters)
