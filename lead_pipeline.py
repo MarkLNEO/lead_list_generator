@@ -5253,6 +5253,76 @@ class EnrichmentRequestProcessor:
         self.supabase.update_request_record(request_id, status="failed", request_payload=request_clone)
 
     @staticmethod
+    def _build_discovery_requirements(
+        original_req: Optional[str],
+        location: Optional[str],
+        pms: Optional[str],
+        unit_min: Optional[int],
+    ) -> str:
+        """
+        Build actionable discovery requirements, removing contradictory language
+        and adding context-aware guidance.
+        """
+        # Start with clean base requirements
+        parts = []
+
+        if location:
+            parts.append(f"Find property management companies in {location}.")
+
+        if pms:
+            parts.append(f"Must use {pms} as their property management system.")
+
+        if unit_min:
+            parts.append(f"Must manage at least {unit_min} units.")
+
+        # Add original request context if useful (filter out contradictions)
+        if original_req:
+            # Remove common contradictory phrases
+            cleaned = original_req
+            contradictions = [
+                "Only an email address was provided",
+                "no targeting",
+                "no quantity",
+                "no locations",
+                "no PMS",
+                "no units",
+                "no campaign type",
+                "no timeframe specified",
+            ]
+            for phrase in contradictions:
+                if phrase.lower() in cleaned.lower():
+                    # Split on "/" and take only the useful part
+                    if "/" in cleaned:
+                        parts_split = cleaned.split("/")
+                        cleaned = parts_split[0].strip()
+                    break
+
+            # If there's still useful context, add it
+            if cleaned and cleaned not in " ".join(parts):
+                parts.append(cleaned.strip())
+
+        # Add discovery guidance based on PMS
+        if pms:
+            pms_lower = pms.lower()
+            if "buildium" in pms_lower:
+                parts.append(
+                    "Note: Buildium does not publish customer directories. "
+                    "Try alternative discovery: NARPM member lists, LinkedIn job postings mentioning Buildium, "
+                    "or run PMS analyzer on local property management company domains."
+                )
+            elif "appfolio" in pms_lower:
+                parts.append(
+                    "Note: AppFolio customers often have .appfolio.com portals. "
+                    "Check for corporate website mentions of AppFolio or run PMS analyzer."
+                )
+            elif "propertyware" in pms_lower:
+                parts.append(
+                    "Note: Propertyware customers may be listed on their partner page or in industry directories."
+                )
+
+        return " ".join(parts)
+
+    @staticmethod
     def _build_args_from_request(request: Dict[str, Any]) -> argparse.Namespace:
         parameters = request.get("parameters") or {}
 
@@ -5286,7 +5356,14 @@ class EnrichmentRequestProcessor:
         unit_min = parameters.get("units_min") or parameters.get("unit_min")
         unit_max = parameters.get("units_max") or parameters.get("unit_max")
 
-        requirements = parameters.get("requirements") or parameters.get("notes") or request.get("natural_request")
+        # Build clean, actionable requirements instead of using raw notes
+        original_req = parameters.get("requirements") or parameters.get("notes") or request.get("natural_request")
+        requirements = EnrichmentRequestProcessor._build_discovery_requirements(
+            original_req,
+            location,
+            pms,
+            int(unit_min) if unit_min not in (None, "") else None,
+        )
 
         exclude = parameters.get("exclude_domains") or parameters.get("suppress_domains") or parameters.get("suppression_domains") or []
         if isinstance(exclude, str):
