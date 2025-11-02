@@ -1750,6 +1750,8 @@ class HubSpotClient:
         self.base_url = config.hubspot_base_url.rstrip("/")
         self.token = config.hubspot_token
         self.recent_activity_days = config.hubspot_recent_activity_days
+        # Per-run cache for suppression decisions (domain → is_allowed boolean)
+        self._suppression_cache: Dict[str, bool] = {}
 
     def _request(
         self,
@@ -1856,8 +1858,13 @@ class HubSpotClient:
             logging.debug("Allowing %s (no domain present)", company.get("company_name"))
             return True
 
+        # Check cache first for O(1) lookup
+        if domain in self._suppression_cache:
+            return self._suppression_cache[domain]
+
         existing = self.search_company_by_domain(domain)
         if not existing:
+            self._suppression_cache[domain] = True
             return True
 
         properties = existing.get("properties") or {}
@@ -1869,13 +1876,16 @@ class HubSpotClient:
                 domain,
                 lifecycle or "unknown",
             )
+            self._suppression_cache[domain] = False
             return False
 
         hubspot_id = existing.get("id")
         if hubspot_id and self.has_recent_activity(hubspot_id):
             logging.info("Suppressing %s (%s) due to recent activity", company.get("company_name"), domain)
+            self._suppression_cache[domain] = False
             return False
 
+        self._suppression_cache[domain] = True
         return True
 
     def filter_companies(self, companies: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2759,6 +2769,10 @@ class LeadOrchestrator:
         self.metrics = {
             "start_time": time.time(),
             "companies_discovered": 0,
+            "companies_suppressed": 0,
+            "companies_location_filtered": 0,
+            "companies_pm_filtered": 0,
+            "companies_deduped": 0,
             "companies_enriched": 0,
             "companies_rejected": 0,
             "contacts_discovered": 0,
@@ -2861,7 +2875,66 @@ class LeadOrchestrator:
             "context": context,
         })
         logging.error("Error: %s | Context: %s", error, json.dumps(context))
-    
+
+    def _log_phase_summary(self, delivered: int, requested: int) -> None:
+        """Log comprehensive funnel metrics showing the full pipeline flow."""
+        logging.info("=" * 70)
+        logging.info("PIPELINE PHASE SUMMARY")
+        logging.info("=" * 70)
+
+        # Discovery funnel
+        discovered = self.metrics["companies_discovered"]
+        suppressed = self.metrics["companies_suppressed"]
+        location_filtered = self.metrics["companies_location_filtered"]
+        deduped = self.metrics["companies_deduped"]
+        enriched = self.metrics["companies_enriched"]
+        rejected = self.metrics["companies_rejected"]
+
+        logging.info("Company Funnel:")
+        logging.info("  Discovered:         %5d", discovered)
+        if suppressed > 0:
+            logging.info("  - Suppressed (HubSpot): -%4d → %5d remaining", suppressed, discovered - suppressed)
+        if deduped > 0:
+            after_dedupe = discovered - suppressed - deduped
+            logging.info("  - Deduped (domain):     -%4d → %5d unique", deduped, max(0, after_dedupe))
+        if location_filtered > 0:
+            logging.info("  - Location filtered:    -%4d", location_filtered)
+        logging.info("  Enriched successfully:  %5d", enriched)
+        if rejected > 0:
+            logging.info("  Rejected (no DMs/fail): %5d", rejected)
+
+        # Contact funnel
+        contacts_found = self.metrics["contacts_discovered"]
+        contacts_verified = self.metrics["contacts_verified"]
+        contacts_enriched = self.metrics["contacts_enriched"]
+        contacts_rejected = self.metrics["contacts_rejected"]
+        anecdote_rejects = self.metrics["contacts_anecdote_rejections"]
+
+        logging.info("")
+        logging.info("Contact Funnel:")
+        logging.info("  Discovered:         %5d", contacts_found)
+        logging.info("  Verified emails:    %5d (%.1f%%)",
+                     contacts_verified,
+                     100 * contacts_verified / max(1, contacts_found))
+        if anecdote_rejects > 0:
+            logging.info("  - Anecdote rejects:     -%4d", anecdote_rejects)
+        logging.info("  Enriched w/ anecdotes: %5d", contacts_enriched)
+        if contacts_rejected > 0:
+            logging.info("  Rejected (other):      %5d", contacts_rejected)
+
+        # Final tally
+        logging.info("")
+        logging.info("Final Delivery:")
+        logging.info("  Requested:          %5d", requested)
+        logging.info("  Delivered:          %5d", delivered)
+        if delivered >= requested:
+            logging.info("  Status: ✓ Target met")
+        else:
+            shortfall = requested - delivered
+            logging.info("  Status: ⚠ Short by %d (%.1f%% of target)", shortfall, 100 * shortfall / requested)
+
+        logging.info("=" * 70)
+
     def _checkpoint_if_needed(self, state: Dict[str, Any]) -> None:
         """Save checkpoint if interval elapsed."""
         if self.state_manager and self.state_manager.should_checkpoint():
@@ -2925,9 +2998,11 @@ class LeadOrchestrator:
                     self.requested_state or "",
                 )
         if len(matched) != len(companies):
+            filtered_count = len(companies) - len(matched)
+            self.metrics["companies_location_filtered"] += filtered_count
             logging.info(
                 "Location filter removed %d/%d companies",
-                len(companies) - len(matched),
+                filtered_count,
                 len(companies),
         )
         return matched
@@ -3434,6 +3509,9 @@ class LeadOrchestrator:
                 self._track_error("Final gate failed", {"requested": target_quantity, "have": len(deliverable)})
                 raise ValueError(error_msg)
 
+            # Log comprehensive phase summary
+            self._log_phase_summary(len(deliverable), target_quantity)
+
             logging.info("Pipeline complete: %d fully enriched companies", len(deliverable))
 
             # Save outputs
@@ -3544,7 +3622,13 @@ class LeadOrchestrator:
     def _apply_suppression(self, companies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not companies:
             return []
-        return self.hubspot.filter_companies(companies)
+        before = len(companies)
+        filtered = self.hubspot.filter_companies(companies)
+        suppressed = before - len(filtered)
+        self.metrics["companies_suppressed"] += suppressed
+        if suppressed > 0:
+            logging.debug("Suppressed %d companies via HubSpot", suppressed)
+        return filtered
 
     def _merge_companies(
         self,
@@ -3553,12 +3637,17 @@ class LeadOrchestrator:
     ) -> List[Dict[str, Any]]:
         known_domains: Set[str] = {self._domain_key(company) for company in existing}
         merged = list(existing)
+        deduped_count = 0
         for company in new_companies:
             domain = self._domain_key(company)
             if domain and domain in known_domains:
+                deduped_count += 1
                 continue
             known_domains.add(domain)
             merged.append(company)
+        if deduped_count > 0:
+            self.metrics["companies_deduped"] += deduped_count
+            logging.debug("Deduped %d companies by domain", deduped_count)
         return merged
 
     @staticmethod
